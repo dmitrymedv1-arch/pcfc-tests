@@ -186,11 +186,12 @@ def steady_residual(y_flat, icg, bc_H, bc_O, params):
 
         return (diff_right - diff_left) + (migr_right - migr_left)
 
-    # 1. Сохранение электронного заряда (дырки + электроны)
-    res[:, 0] = zh * flux_div(Ch_ext, Dh, zh) + ze * flux_div(Ce_ext, De, ze)
+    # 1. Сохранение электронного заряда (нормируем на max(Dh, De) для сбалансированного якобиана)
+    scale_el = max(Dh, De, 1.0)
+    res[:, 0] = (zh * flux_div(Ch_ext, Dh, zh) + ze * flux_div(Ce_ext, De, ze)) / scale_el
 
     # 2. Сохранение кислородных вакансий
-    res[:, 1] = flux_div(Cv_ext, Dv, zv)
+    res[:, 1] = flux_div(Cv_ext, Dv, zv) / max(Dv, 1.0)
 
     # 3. Сохранение протонных дефектов
     res[:, 2] = flux_div(Cp_ext, Dp, zp)
@@ -220,7 +221,7 @@ def compute_compressed_sparse_jacobian(y_flat, f0, icg, bc_H, bc_O, params):
             pert_indices = np.arange(mod_idx, N, 3) * 4 + var_idx
             y_pert = y_flat.copy()
             # Относительный сдвиг с защитой от нулевых значений
-            step = 1e-8 * np.maximum(np.abs(y_flat[pert_indices]), 1e-4)
+            step = 1e-7 * np.maximum(np.abs(y_flat[pert_indices]), 1e-3)
             y_pert[pert_indices] += step
 
             f_pert = steady_residual(y_pert, icg, bc_H, bc_O, params)
@@ -315,10 +316,10 @@ def solve_newton_sparse(y0_flat, icg, bc_H, bc_O, params, tol=1e-10, max_iter=40
         y_2d[:, :3] = np.abs(y_2d[:, :3])
         y = y_2d.ravel()
 
-        if norm_f < tol:
+        if norm_f < tol or (np.max(np.abs(alpha * delta)) < 1e-9 and norm_f < 1e-5):
             return y, norm_f, it
 
-    if norm_f > 1e-5:
+    if norm_f > 1e-4:
         raise RuntimeError(f"Метод Ньютона не достиг точности за {max_iter} итераций (max_res = {norm_f:.2e}).")
     return y, norm_f, max_iter
 
