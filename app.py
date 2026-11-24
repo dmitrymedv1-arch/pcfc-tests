@@ -421,6 +421,120 @@ def find_special_points(T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, ma
 
 
 # =============================================================================
+# 2.5 CACHED COMPUTATION WRAPPERS (PREVENT REDUNDANT RE-COMPUTATION)
+# =============================================================================
+@st.cache_data(show_spinner=False)
+def cached_single_point(i_A_cm2, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat_tuple, solver_mode, use_arcsinh_shift, n_grid=80):
+    mat = dict(mat_tuple)
+    return solve_single_point(i_A_cm2, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, solver_mode, use_arcsinh_shift, n_grid)
+
+
+@st.cache_data(show_spinner="Computing I–V sweep...")
+def cached_iv_sweep(i_min, i_max, n_pts, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat_tuple, solver_mode, use_arcsinh_shift):
+    mat = dict(mat_tuple)
+    i_grid = np.linspace(i_min, i_max, n_pts)
+    sweep_rows = []
+    for iv in i_grid:
+        r = solve_single_point(
+            float(iv), T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R,
+            mat, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift, n_grid=40
+        )
+        sweep_rows.append({k: r[k] for k in [
+            "i", "V_cell", "E_eq", "dPhi", "eta_H", "eta_O",
+            "i_p", "i_v", "i_h", "r_leak", "t_p", "t_v", "t_h",
+            "FE", "eff_LHV", "P_elec", "q_dot", "V_TN_theo", "V_TN_act"
+        ]})
+    return pd.DataFrame(sweep_rows)
+
+
+@st.cache_data(show_spinner="Computing multiparametric analysis...")
+def cached_multiparametric(
+    param_key, v_min, v_max, n_vals, i_min, i_max, i_work,
+    T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
+    binary_fuel, mat_tuple, use_arcsinh_shift
+):
+    mat = dict(mat_tuple)
+    var_values = np.linspace(v_min, v_max, n_vals)
+    i_multi = np.linspace(i_min, i_max, 33)
+    multi_iv = {}
+    summary_rows = []
+
+    for val in var_values:
+        T_v = float(val) if param_key == "T_C" else T_work
+        L_v = float(val) if param_key == "L_um" else L_work
+        cR_v = float(val) if param_key == "c_R" else c_R_work
+        pH2_v = float(val) if param_key == "p_H2_f" else p_H2_f
+        pH2Of_v = max(1.0 - pH2_v, 1e-4) if (param_key == "p_H2_f" and binary_fuel) else p_H2O_f
+        pH2Oo_v = float(val) if param_key == "p_H2O_o" else p_H2O_o
+        RpH_v = float(val) if param_key == "Rp" else Rp_H
+        RpO_v = float(val) if param_key == "Rp" else Rp_O
+
+        rows_v = []
+        for iv in i_multi:
+            r = solve_single_point(
+                float(iv), T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v,
+                mat, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=25
+            )
+            rows_v.append({k: r[k] for k in ["i", "V_cell", "i_h", "FE", "P_elec"]})
+        multi_iv[float(val)] = pd.DataFrame(rows_v)
+
+        r_ocv = solve_single_point(0.0, T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat, "fast", use_arcsinh_shift, 25)
+        r_wk = solve_single_point(i_work, T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat, "fast", use_arcsinh_shift, 25)
+        P_max, i_Pmax, i_TN, V_TN_pt, i_trans = find_special_points(
+            T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat, use_arcsinh_shift
+        )
+
+        summary_rows.append({
+            "param": float(val),
+            "P_max": P_max, "i_Pmax": i_Pmax,
+            "i_TN": i_TN, "V_TN_pt": V_TN_pt,
+            "J_H2": abs(r_wk["J_H2"]), "J_H2_Nml_min": abs(r_wk["J_H2_Nml_min"]),
+            "FE_wk": r_wk["FE"], "eff_wk": r_wk["eff_LHV"],
+            "E_eq": r_ocv["E_eq"], "OCV": r_ocv["V_cell"],
+            "RdOCV_mV": (r_ocv["E_eq"] - r_ocv["V_cell"]) * 1e3,
+            "i_leak_OCV": abs(r_ocv["i_h"]), "i_trans": i_trans,
+            "ASR_ohm": r_wk["ASR_ohm"], "t_p_wk": r_wk["t_p"] * 100.0,
+            "q_dot_wk": r_wk["q_dot"], "V_cell_wk": r_wk["V_cell"],
+        })
+
+    return var_values, multi_iv, pd.DataFrame(summary_rows)
+
+
+@st.cache_data(show_spinner="Computing 2D heatmaps...")
+def cached_heatmaps(res_hm, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_tuple, use_arcsinh_shift):
+    mat = dict(mat_tuple)
+    T_hm = np.linspace(480, 700, res_hm)
+    i_hm_ec = np.linspace(-1.8, -0.1, res_hm)
+    L_hm = np.linspace(3.0, 50.0, res_hm)
+    x_hm = np.linspace(0.0, 1.0, res_hm)
+
+    FE_map = np.zeros((res_hm, res_hm))
+    Q_map = np.zeros((res_hm, res_hm))
+    Eff_L_map = np.zeros((res_hm, res_hm))
+    pO2_map = np.zeros((res_hm, res_hm))
+
+    for idx_t, tv in enumerate(T_hm):
+        for idx_i, iv in enumerate(i_hm_ec):
+            r = solve_single_point(float(iv), float(tv), L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat, "fast", use_arcsinh_shift, 15)
+            FE_map[idx_t, idx_i] = np.clip(r["FE"], 0, 100)
+            Q_map[idx_t, idx_i] = r["q_dot"]
+
+    for idx_l, lv in enumerate(L_hm):
+        for idx_i, iv in enumerate(i_hm_ec):
+            r = solve_single_point(float(iv), T_work, float(lv), Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat, "fast", use_arcsinh_shift, 15)
+            Eff_L_map[idx_l, idx_i] = np.clip(r["eff_LHV"], 0, 100)
+
+    for idx_i, iv in enumerate(i_hm_ec):
+        r = solve_single_point(float(iv), T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat, "fast", use_arcsinh_shift, res_hm)
+        pO2_map[:, idx_i] = np.log10(np.maximum(r["p_O2_int"], 1e-30))
+
+    return T_hm, i_hm_ec, L_hm, x_hm, FE_map, Q_map, Eff_L_map, pO2_map
+
+
+# =============================================================================
+# 3. SIDEBAR: INPUT PARAMETERS & PUBLICATION PLOT SETTINGS
+# =============================================================================
+# =============================================================================
 # 3. SIDEBAR: INPUT PARAMETERS & PUBLICATION PLOT SETTINGS
 # =============================================================================
 st.sidebar.title("⚙️ Model Parameters")
@@ -553,9 +667,10 @@ def render_plot_with_download(fig, filename_base: str):
 st.title("⚡ Unified PCEC / PCFC Electro-, Mass-, and Heat-Transfer Model")
 st.caption(f"Electrolyte: **{preset_name}** | Solver: **{solver_label}** | Carriers: OH•, V••, O•")
 
-res_pt = solve_single_point(
+mat_tuple = tuple(sorted(mat_params.items()))
+res_pt = cached_single_point(
     i_work, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
-    mat_params, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift
+    mat_tuple, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift
 )
 
 if solver_mode == "bvp" and not res_pt["bvp_converged"]:
@@ -654,19 +769,10 @@ with tab2:
     i_max = col_i2.number_input("Max Current Density (PCFC) (A cm⁻²)", 0.1, 3.0, 1.0, 0.1)
     n_pts = col_i3.slider("Sweep Points", 20, 80, 41)
 
-    i_grid = np.linspace(i_min, i_max, n_pts)
-    sweep_rows = []
-    for iv in i_grid:
-        r = solve_single_point(
-            float(iv), T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
-            mat_params, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift, n_grid=40
-        )
-        sweep_rows.append({k: r[k] for k in [
-            "i", "V_cell", "E_eq", "dPhi", "eta_H", "eta_O",
-            "i_p", "i_v", "i_h", "r_leak", "t_p", "t_v", "t_h",
-            "FE", "eff_LHV", "P_elec", "q_dot", "V_TN_theo", "V_TN_act"
-        ]})
-    df_i = pd.DataFrame(sweep_rows)
+    df_i = cached_iv_sweep(
+        i_min, i_max, n_pts, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
+        mat_tuple, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift
+    )
 
     c1, c2 = st.columns(2)
     with c1:
@@ -780,55 +886,16 @@ with tab3:
     if v_max <= v_min:
         st.error("Max value must be greater than Min value.")
     else:
-        var_values = np.linspace(v_min, v_max, n_vals)
+        var_values, multi_iv, df_sum = cached_multiparametric(
+            p_cfg["key"], float(v_min), float(v_max), int(n_vals),
+            float(i_min), float(i_max), float(i_work),
+            float(T_work), float(L_work), float(Rp_H), float(Rp_O),
+            float(p_H2_f), float(p_H2O_f), float(p_H2O_o), float(c_R_work),
+            binary_fuel, mat_tuple, use_arcsinh_shift
+        )
         cmap = plt.get_cmap(cmap_multi)
         colors = [cmap(k / max(len(var_values) - 1, 1)) for k in range(len(var_values))]
         leg_title_use = custom_legend_title.strip() if custom_legend_title.strip() else var_label
-
-        i_multi = np.linspace(i_min, i_max, 33)
-        multi_iv = {}
-        summary_rows = []
-
-        for val in var_values:
-            # Override only the selected parameter
-            T_v = float(val) if p_cfg["key"] == "T_C" else T_work
-            L_v = float(val) if p_cfg["key"] == "L_um" else L_work
-            cR_v = float(val) if p_cfg["key"] == "c_R" else c_R_work
-            pH2_v = float(val) if p_cfg["key"] == "p_H2_f" else p_H2_f
-            pH2Of_v = max(1.0 - pH2_v, 1e-4) if (p_cfg["key"] == "p_H2_f" and binary_fuel) else p_H2O_f
-            pH2Oo_v = float(val) if p_cfg["key"] == "p_H2O_o" else p_H2O_o
-            RpH_v = float(val) if p_cfg["key"] == "Rp" else Rp_H
-            RpO_v = float(val) if p_cfg["key"] == "Rp" else Rp_O
-
-            rows_v = []
-            for iv in i_multi:
-                r = solve_single_point(
-                    float(iv), T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v,
-                    mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=25
-                )
-                rows_v.append(r)
-            multi_iv[val] = pd.DataFrame(rows_v)
-
-            r_ocv = solve_single_point(0.0, T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, "fast", use_arcsinh_shift, 25)
-            r_wk = solve_single_point(i_work, T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, "fast", use_arcsinh_shift, 25)
-            P_max, i_Pmax, i_TN, V_TN_pt, i_trans = find_special_points(
-                T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, use_arcsinh_shift
-            )
-
-            summary_rows.append({
-                "param": val,
-                "P_max": P_max, "i_Pmax": i_Pmax,
-                "i_TN": i_TN, "V_TN_pt": V_TN_pt,
-                "J_H2": abs(r_wk["J_H2"]), "J_H2_Nml_min": abs(r_wk["J_H2_Nml_min"]),
-                "FE_wk": r_wk["FE"], "eff_wk": r_wk["eff_LHV"],
-                "E_eq": r_ocv["E_eq"], "OCV": r_ocv["V_cell"],
-                "RdOCV_mV": (r_ocv["E_eq"] - r_ocv["V_cell"]) * 1e3,
-                "i_leak_OCV": abs(r_ocv["i_h"]), "i_trans": i_trans,
-                "ASR_ohm": r_wk["ASR_ohm"], "t_p_wk": r_wk["t_p"] * 100.0,
-                "q_dot_wk": r_wk["q_dot"], "V_cell_wk": r_wk["V_cell"],
-            })
-
-        df_sum = pd.DataFrame(summary_rows)
 
         st.markdown("### Families of Curves vs. Current Density")
         c1, c2 = st.columns(2)
@@ -993,30 +1060,11 @@ with tab4:
     st.subheader("2D Parametric Heatmaps")
     res_hm = st.slider("Heatmap Grid Resolution (N × N)", 12, 35, 20)
 
-    T_hm = np.linspace(480, 700, res_hm)
-    i_hm_ec = np.linspace(-1.8, -0.1, res_hm)
-    L_hm = np.linspace(3.0, 50.0, res_hm)
-
-    FE_map = np.zeros((res_hm, res_hm))
-    Q_map = np.zeros((res_hm, res_hm))
-    Eff_L_map = np.zeros((res_hm, res_hm))
-    pO2_map = np.zeros((res_hm, res_hm))
-
-    for idx_t, tv in enumerate(T_hm):
-        for idx_i, iv in enumerate(i_hm_ec):
-            r = solve_single_point(float(iv), float(tv), L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_params, "fast", use_arcsinh_shift, 15)
-            FE_map[idx_t, idx_i] = np.clip(r["FE"], 0, 100)
-            Q_map[idx_t, idx_i] = r["q_dot"]
-
-    for idx_l, lv in enumerate(L_hm):
-        for idx_i, iv in enumerate(i_hm_ec):
-            r = solve_single_point(float(iv), T_work, float(lv), Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_params, "fast", use_arcsinh_shift, 15)
-            Eff_L_map[idx_l, idx_i] = np.clip(r["eff_LHV"], 0, 100)
-
-    x_hm = np.linspace(0.0, 1.0, res_hm)
-    for idx_i, iv in enumerate(i_hm_ec):
-        r = solve_single_point(float(iv), T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_params, "fast", use_arcsinh_shift, res_hm)
-        pO2_map[:, idx_i] = np.log10(np.maximum(r["p_O2_int"], 1e-30))
+    T_hm, i_hm_ec, L_hm, x_hm, FE_map, Q_map, Eff_L_map, pO2_map = cached_heatmaps(
+        res_hm, float(T_work), float(L_work), float(Rp_H), float(Rp_O),
+        float(p_H2_f), float(p_H2O_f), float(p_H2O_o), float(c_R_work),
+        mat_tuple, use_arcsinh_shift
+    )
 
     c1, c2 = st.columns(2)
     with c1:
