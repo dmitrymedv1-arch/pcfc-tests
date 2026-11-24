@@ -680,7 +680,7 @@ with tab3:
     if len(selected_temps) < 2:
         st.info("Выберите хотя бы 2 температуры для построения сравнительных графиков.")
     else:
-        cmap = cm.get_cmap(cmap_multi)
+        cmap = plt.get_cmap(cmap_multi)
         colors = [cmap(k / max(len(selected_temps) - 1, 1)) for k in range(len(selected_temps))]
 
         i_multi = np.linspace(i_min, i_max, 35)
