@@ -196,10 +196,10 @@ def steady_residual(y_flat, icg, bc_H, bc_O, params):
     # 3. Сохранение протонных дефектов
     res[:, 2] = flux_div(Cp_ext, Dp, zp)
 
-    # 4. Уравнение электронейтральности / Пуассона с равномерным масштабированием
-    laplacian_phi = (Phi_ext[2:] - 2.0 * Phi_ext[1:-1] + Phi_ext[:-2]) / (dx * dx)
+    # 4. Уравнение электронейтральности / Пуассона (масштабировано на 2*dx^2, как и уравнения потоков)
+    d2_phi = Phi_ext[2:] - 2.0 * Phi_ext[1:-1] + Phi_ext[:-2]
     charge_density = zh * Ch + ze * Ce + zv * Cv + zp * Cp - Cd
-    res[:, 3] = eps_term * laplacian_phi + charge_density
+    res[:, 3] = 2.0 * eps_term * d2_phi + (2.0 * dx * dx) * charge_density
 
     return res.ravel()
 
@@ -302,8 +302,9 @@ def solve_newton_sparse(y0_flat, icg, bc_H, bc_O, params, tol=1e-10, max_iter=40
             alpha *= 0.5
 
         if not accepted:
-            # Делаем малый пробный шаг, если ландшафт сильно нелинеен
-            y = y + 1e-3 * scale_limit * delta
+            # Если мы уже близко к решению (norm_f < 1e-2), делаем полный шаг Ньютона без затухания
+            step_factor = scale_limit if norm_f < 1e-2 else 1e-2 * scale_limit
+            y = y + step_factor * delta
             y_2d = y.reshape((N, 4))
             y_2d[:, :3] = np.abs(y_2d[:, :3])
             y_2d[:, 0] = np.maximum(y_2d[:, 0], 1e-14)
