@@ -1,4 +1,5 @@
 import io
+import zipfile
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -14,6 +15,9 @@ st.set_page_config(
     page_icon="⚡",
     layout="wide"
 )
+
+# NumPy 1.x / 2.x trapezoidal integration compatibility
+_trapz = getattr(np, "trapezoid", np.trapz)
 
 R_GAS = 8.314462618      # J / (mol * K)
 F_CONST = 96485.33212    # C / mol
@@ -129,6 +133,72 @@ def compute_gas_fluxes(J_p, J_v, p_H2_f, p_H2O_f, p_O2_f):
     return J_H2, J_H2O, J_O2
 
 
+def _solve_bvp_with_homotopy(
+    x_norm, pf, vf, hf, po, vo, ho, c_R,
+    D_p, D_v, D_h, L_m, Vm, T_K, i_A_m2,
+    cp_init, cv_init, ch_init, Jp_init, Jv_init, Jh_init, u1_init
+):
+    """
+    Solves 1D Nernst-Planck-Poisson BVP with current-continuation (homotopy)
+    for high convergence robustness at elevated current densities.
+    """
+    Dp_nd = 1.0
+    Dv_nd = D_v / D_p
+    Dh_nd = D_h / D_p
+    eps_reg = max(100.0 * Vm * R_GAS * T_K / (F_CONST ** 2 * L_m ** 2), 1e-4)
+    i_target_nd = i_A_m2 * L_m * Vm / (D_p * F_CONST)
+
+    def make_ode():
+        def ode_rhs(x, y):
+            cp, cv, ch, Jp_n, Jv_n, Jh_n, Phi_n, dPhi_n = y
+            dcp = -Jp_n / Dp_nd - 1.0 * cp * dPhi_n
+            dcv = -Jv_n / Dv_nd - 2.0 * cv * dPhi_n
+            dch = -Jh_n / Dh_nd - 1.0 * ch * dPhi_n
+            zeros = np.zeros_like(x)
+            d2Phi = -(cp + 2.0 * cv + ch - c_R) / eps_reg
+            return np.vstack([dcp, dcv, dch, zeros, zeros, zeros, dPhi_n, d2Phi])
+        return ode_rhs
+
+    def make_bc(i_nd_val):
+        def bc_func(ya, yb):
+            return np.array([
+                ya[0] - pf, ya[1] - vf, ya[2] - hf,
+                yb[0] - po, yb[1] - vo, yb[2] - ho,
+                ya[6] - 0.0,
+                (yb[3] + 2.0 * yb[4] + yb[5]) - i_nd_val,
+            ])
+        return bc_func
+
+    y_guess = np.vstack([
+        cp_init, cv_init, ch_init,
+        np.full_like(x_norm, Jp_init * L_m * Vm / D_p),
+        np.full_like(x_norm, Jv_init * L_m * Vm / D_p),
+        np.full_like(x_norm, Jh_init * L_m * Vm / D_p),
+        u1_init * x_norm,
+        np.full_like(x_norm, u1_init),
+    ])
+
+    ode_rhs = make_ode()
+    max_nodes = 2000
+
+    # Direct attempt first
+    sol = solve_bvp(ode_rhs, make_bc(i_target_nd), x_norm, y_guess, tol=1e-4, max_nodes=max_nodes)
+    if sol.success:
+        return sol, True, sol.x.size >= int(0.9 * max_nodes)
+
+    # Homotopy continuation from 20% to 100% of target current
+    x_curr = x_norm
+    y_curr = y_guess
+    for frac in [0.2, 0.5, 0.8, 1.0]:
+        sol = solve_bvp(ode_rhs, make_bc(i_target_nd * frac), x_curr, y_curr, tol=1e-4, max_nodes=max_nodes)
+        if not sol.success:
+            return sol, False, False
+        x_curr = sol.x
+        y_curr = sol.y
+
+    return sol, True, sol.x.size >= int(0.9 * max_nodes)
+
+
 def solve_single_point(
     i_A_cm2: float,
     T_C: float,
@@ -156,6 +226,8 @@ def solve_single_point(
     K_W, K_H2O, K_O2, D_p, D_v, D_h = get_material_props(T_K, mat)
 
     # Gas-phase equilibria at both boundaries
+    # Note: p_O2_f is the virtual oxygen partial pressure defined by H2/H2O equilibrium (K_W)
+    # to ensure thermodynamic consistency of defect chemical potentials at the fuel boundary.
     p_O2_o = max(0.21 * (1.0 - p_H2O_o), 1e-12)
     p_O2_f = (p_H2O_f / (K_W * max(p_H2_f, 1e-12))) ** 2
     p_H2_o = p_H2O_o / (K_W * np.sqrt(p_O2_o))
@@ -196,7 +268,7 @@ def solve_single_point(
 
     lo, hi = -3.0, 3.0
     f_lo, f_hi = total_current_alg(lo), total_current_alg(hi)
-    for _ in range(10):
+    for _ in range(12):
         if f_lo * f_hi < 0:
             break
         lo *= 2.0
@@ -218,48 +290,20 @@ def solve_single_point(
     J_p = -(D_p / L_m) * bernoulli_flux(u1_alg, cf_p, co_p)
     J_v = -(D_v / L_m) * bernoulli_flux(u2_alg, cf_v, co_v)
     J_h = -(D_h / L_m) * bernoulli_flux(u1_alg, cf_h, co_h)
+
     bvp_converged = True
+    bvp_mesh_warn = False
+    solver_used = "Algebraic (Constant Field)"
 
-    # --- STEP 2: EXACT 1D BVP SOLVER (VARIABLE FIELD + POISSON) ---
+    # --- STEP 2: EXACT 1D BVP SOLVER (VARIABLE FIELD + POISSON + HOMOTOPY) ---
     if solver_mode == "bvp":
-        Dp_nd = 1.0
-        Dv_nd = D_v / D_p
-        Dh_nd = D_h / D_p
-        i_nd = i_A_m2 * L_m * Vm / (D_p * F_CONST)
-        eps_reg = max(100.0 * Vm * R_GAS * T_K / (F_CONST ** 2 * L_m ** 2), 1e-4)
-
-        Jp_nd0 = J_p * L_m * Vm / D_p
-        Jv_nd0 = J_v * L_m * Vm / D_p
-        Jh_nd0 = J_h * L_m * Vm / D_p
-
-        def ode_rhs(x, y):
-            cp, cv, ch, Jp_n, Jv_n, Jh_n, Phi_n, dPhi_n = y
-            dcp = -Jp_n / Dp_nd - 1.0 * cp * dPhi_n
-            dcv = -Jv_n / Dv_nd - 2.0 * cv * dPhi_n
-            dch = -Jh_n / Dh_nd - 1.0 * ch * dPhi_n
-            zeros = np.zeros_like(x)
-            d2Phi = -(cp + 2.0 * cv + ch - c_R) / eps_reg
-            return np.vstack([dcp, dcv, dch, zeros, zeros, zeros, dPhi_n, d2Phi])
-
-        def bc_func(ya, yb):
-            return np.array([
-                ya[0] - pf, ya[1] - vf, ya[2] - hf,
-                yb[0] - po, yb[1] - vo, yb[2] - ho,
-                ya[6] - 0.0,
-                (yb[3] + 2.0 * yb[4] + yb[5]) - i_nd,
-            ])
-
-        y_init = np.vstack([
-            cp_prof, cv_prof, ch_prof,
-            np.full_like(x_norm, Jp_nd0),
-            np.full_like(x_norm, Jv_nd0),
-            np.full_like(x_norm, Jh_nd0),
-            u1_alg * x_norm,
-            np.full_like(x_norm, u1_alg),
-        ])
-
-        sol = solve_bvp(ode_rhs, bc_func, x_norm, y_init, tol=1e-4, max_nodes=1500)
-        if sol.success:
+        sol, ok, mesh_warn = _solve_bvp_with_homotopy(
+            x_norm, pf, vf, hf, po, vo, ho, c_R,
+            D_p, D_v, D_h, L_m, Vm, T_K, i_A_m2,
+            cp_prof, cv_prof, ch_prof, J_p, J_v, J_h, u1_alg
+        )
+        if ok:
+            # Re-interpolate onto uniform x_norm grid for smooth spatial derivatives
             y_sol = sol.sol(x_norm)
             cp_prof = np.maximum(y_sol[0], 1e-18)
             cv_prof = np.maximum(y_sol[1], 1e-18)
@@ -271,9 +315,12 @@ def solve_single_point(
             dPhi_dx_prof = y_sol[7] * (R_GAS * T_K / (F_CONST * L_m))
             E_field_prof = -dPhi_dx_prof
             dPhi_final = float(Phi_prof[-1] - Phi_prof[0])
+            bvp_mesh_warn = mesh_warn
+            solver_used = "1D BVP (Exact)"
         else:
             bvp_converged = False
             dPhi_final = dPhi_alg
+            solver_used = "Algebraic Fallback"
     else:
         dPhi_final = dPhi_alg
 
@@ -287,11 +334,11 @@ def solve_single_point(
     sig_h_prof = pref * (1.0 ** 2) * ch_prof * D_h
     sig_tot_prof = sig_p_prof + sig_v_prof + sig_h_prof
 
-    # Membrane Ohmic ASR (Ohm cm^2) integrated across thickness
+    # Membrane Ohmic ASR (Ohm cm^2) integrated across uniform x_norm grid
     L_cm = L_um * 1e-4
-    ASR_ohm = float(np.trapezoid(1.0 / np.maximum(sig_tot_prof, 1e-15), x_norm) * L_cm)
+    ASR_ohm = float(_trapz(1.0 / np.maximum(sig_tot_prof, 1e-15), x_norm) * L_cm)
 
-    # Spatial polaron leakage current components (A/cm^2)
+    # Spatial polaron leakage current components (A/cm^2) on uniform x_m grid
     x_m = x_norm * L_m
     dch_dx = np.gradient(ch_prof / Vm, x_m)
     i_h_diff_prof = (-F_CONST * D_h * dch_dx) * 1e-4
@@ -301,6 +348,7 @@ def solve_single_point(
     p_H2O_int = (cp_prof ** 2) / (co_prof * cv_prof * K_H2O)
     p_O2_int = ((ch_prof ** 2) / (co_prof * cv_prof * K_O2)) ** 2
     p_H2_int = p_H2O_int / (K_W * np.sqrt(np.maximum(p_O2_int, 1e-35)))
+    p_O2_max = float(np.max(p_O2_int))
 
     # Partial current densities (A/cm^2)
     i_p = (1.0 * F_CONST * J_p) * 1e-4
@@ -339,6 +387,8 @@ def solve_single_point(
     t_h_cond = float(np.mean(sig_h_prof / sig_tot_prof))
 
     # Thermal balance (W/cm^2) and LHV energy efficiency (%)
+    # Energy conservation: q_dot = -i_tot * V_cell + J_H2 * |dH_W|
+    # q_dot > 0: exothermic heat release; q_dot < 0: endothermic heat absorption
     J_H2_cm2 = J_H2 * 1e-4  # mol cm^-2 s^-1
     J_H2_Nml_min = J_H2_cm2 * V_MOLAR_STP * 60.0  # Nml cm^-2 min^-1
     q_dot = -i_tot * V_cell + J_H2_cm2 * abs(DH_W)
@@ -357,12 +407,14 @@ def solve_single_point(
 
     return {
         "mode": mode_str,
+        "solver_used": solver_used,
         "bvp_converged": bvp_converged,
+        "bvp_mesh_warn": bvp_mesh_warn,
         "T_C": T_C, "i": i_tot, "V_cell": V_cell, "E_eq": E_eq,
         "dPhi": dPhi_final, "eta_H": eta_H, "eta_O": eta_O,
         "i_p": i_p, "i_v": i_v, "i_h": i_h, "r_leak": r_leak,
         "t_p": t_p_cond, "t_v": t_v_cond, "t_h": t_h_cond,
-        "ASR_ohm": ASR_ohm,
+        "ASR_ohm": ASR_ohm, "p_O2_max": p_O2_max,
         "FE": FE * 100.0, "eff_LHV": eff_LHV * 100.0,
         "P_elec": P_elec, "q_dot": q_dot,
         "V_TN_theo": V_TN_theo, "V_TN_act": V_TN_act,
@@ -378,27 +430,29 @@ def solve_single_point(
 
 
 def find_special_points(T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, use_arcsinh_shift):
-    """Finds P_max (PCFC), i_TN & V_TN_act (PCEC), and i_PCFC_to_PCEC."""
-    # 1. Transition current density i_PCFC->PCEC (where i_p = 0)
+    """Adaptively finds P_max (PCFC), i_TN & V_TN_act (PCEC), and transition current i_PCFC->PCEC."""
+    # 1. Adaptive search for transition current density i_PCFC->PCEC (where i_p = 0)
     def ip_func(iv):
         return solve_single_point(iv, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)["i_p"]
 
+    i_trans = np.nan
     try:
-        i_trans = brentq(ip_func, -0.8, 0.2, xtol=1e-4)
+        for span in [0.5, 2.0, 10.0]:
+            if ip_func(-span) * ip_func(span) < 0:
+                i_trans = brentq(ip_func, -span, span, xtol=1e-4)
+                break
     except ValueError:
-        i_trans = np.nan
+        pass
 
-
-    # 2. Thermoneutral current density in PCEC (where q_dot = 0, i < 0)
+    # 2. Adaptive search for thermoneutral current density in PCEC (q_dot = 0, i < 0)
     def q_func(iv):
         return solve_single_point(iv, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)["q_dot"]
 
     i_TN, V_TN_pt = np.nan, np.nan
     try:
-        # Adaptive search for sign change in PCEC region down to -20 A/cm^2
-        i_hi_tn = -0.05
+        i_hi_tn = -0.02
         q_hi = q_func(i_hi_tn)
-        for i_lo_tn in [-1.5, -3.5, -7.0, -12.0, -20.0]:
+        for i_lo_tn in [-1.5, -4.0, -10.0, -25.0, -60.0, -100.0]:
             q_lo = q_func(i_lo_tn)
             if q_lo * q_hi < 0:
                 i_TN = brentq(q_func, i_lo_tn, i_hi_tn, xtol=1e-4)
@@ -407,8 +461,9 @@ def find_special_points(T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, ma
                 break
     except ValueError:
         pass
-    # 3. Maximum power density in PCFC (i > 0)
-    i_fc_scan = np.linspace(0.05, 2.5, 25)
+
+    # 3. Maximum power density in PCFC (i > 0, scanning up to 5.0 A/cm^2)
+    i_fc_scan = np.linspace(0.05, 5.0, 40)
     p_vals = []
     for iv in i_fc_scan:
         r = solve_single_point(float(iv), T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)
@@ -421,7 +476,7 @@ def find_special_points(T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, ma
 
 
 # =============================================================================
-# 2.5 CACHED COMPUTATION WRAPPERS (PREVENT REDUNDANT RE-COMPUTATION)
+# 2.5 CACHED COMPUTATION WRAPPERS
 # =============================================================================
 @st.cache_data(show_spinner=False)
 def cached_single_point(i_A_cm2, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat_tuple, solver_mode, use_arcsinh_shift, n_grid=80):
@@ -442,6 +497,7 @@ def cached_iv_sweep(i_min, i_max, n_pts, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f,
         sweep_rows.append({k: r[k] for k in [
             "i", "V_cell", "E_eq", "dPhi", "eta_H", "eta_O",
             "i_p", "i_v", "i_h", "r_leak", "t_p", "t_v", "t_h",
+            "ASR_ohm", "p_O2_max",
             "FE", "eff_LHV", "P_elec", "q_dot", "V_TN_theo", "V_TN_act"
         ]})
     return pd.DataFrame(sweep_rows)
@@ -487,7 +543,7 @@ def cached_multiparametric(
         summary_rows.append({
             "param": float(val),
             "P_max": P_max, "i_Pmax": i_Pmax,
-            "i_TN": i_TN, "V_TN_pt": V_TN_pt,
+            "i_TN": i_TN, "V_TN_pt": V_TN_pt, "V_TN_act_wk": r_wk["V_TN_act"],
             "J_H2": abs(r_wk["J_H2"]), "J_H2_Nml_min": abs(r_wk["J_H2_Nml_min"]),
             "FE_wk": r_wk["FE"], "eff_wk": r_wk["eff_LHV"],
             "E_eq": r_ocv["E_eq"], "OCV": r_ocv["V_cell"],
@@ -510,6 +566,7 @@ def cached_heatmaps(res_hm, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o
 
     FE_map = np.zeros((res_hm, res_hm))
     Q_map = np.zeros((res_hm, res_hm))
+    Leak_map = np.zeros((res_hm, res_hm))
     Eff_L_map = np.zeros((res_hm, res_hm))
     pO2_map = np.zeros((res_hm, res_hm))
 
@@ -518,6 +575,7 @@ def cached_heatmaps(res_hm, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o
             r = solve_single_point(float(iv), float(tv), L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat, "fast", use_arcsinh_shift, 15)
             FE_map[idx_t, idx_i] = np.clip(r["FE"], 0, 100)
             Q_map[idx_t, idx_i] = r["q_dot"]
+            Leak_map[idx_t, idx_i] = abs(r["i_h"]) * 1e3  # mA/cm^2
 
     for idx_l, lv in enumerate(L_hm):
         for idx_i, iv in enumerate(i_hm_ec):
@@ -528,12 +586,9 @@ def cached_heatmaps(res_hm, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o
         r = solve_single_point(float(iv), T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat, "fast", use_arcsinh_shift, res_hm)
         pO2_map[:, idx_i] = np.log10(np.maximum(r["p_O2_int"], 1e-30))
 
-    return T_hm, i_hm_ec, L_hm, x_hm, FE_map, Q_map, Eff_L_map, pO2_map
+    return T_hm, i_hm_ec, L_hm, x_hm, FE_map, Q_map, Leak_map, Eff_L_map, pO2_map
 
 
-# =============================================================================
-# 3. SIDEBAR: INPUT PARAMETERS & PUBLICATION PLOT SETTINGS
-# =============================================================================
 # =============================================================================
 # 3. SIDEBAR: INPUT PARAMETERS & PUBLICATION PLOT SETTINGS
 # =============================================================================
@@ -571,7 +626,10 @@ with st.sidebar.expander("💨 Electrode Gas Compositions (atm)", expanded=True)
         p_H2O_f = max(1.0 - p_H2_f, 1e-4)
         st.caption(f"Fuel electrode p(H₂O) = {p_H2O_f:.3f} atm")
     else:
-        p_H2O_f = st.slider("Fuel electrode p(H₂O) (atm)", 0.005, 0.50, 0.03, 0.005)
+        p_H2O_f = st.slider("Fuel electrode p(H₂O) (atm)", 0.005, 0.90, 0.03, 0.005)
+        if p_H2_f + p_H2O_f > 1.0001:
+            st.error("Fuel electrode p(H₂) + p(H₂O) exceeds 1.0 atm! Clamping p(H₂O) to 1 - p(H₂).")
+            p_H2O_f = max(1.0 - p_H2_f, 1e-4)
     p_H2O_o = st.slider("Air/steam electrode p(H₂O) (atm)", 0.01, 0.95, 0.50, 0.01)
     st.caption(f"Air/steam electrode p(O₂) = {0.21 * (1.0 - p_H2O_o):.4f} atm")
 
@@ -593,6 +651,7 @@ with st.sidebar.expander("🎨 Publication Plot Settings", expanded=False):
     ms = st.slider("Marker size", 2, 10, 5)
     show_grid = st.checkbox("Show grid lines", value=True)
     show_contours = st.checkbox("Show contour lines & labels on heatmaps", value=True)
+    pO2_crit_atm = st.number_input("Critical internal p(O₂) threshold (atm)", 0.1, 100.0, 1.0, 0.5)
     cmap_multi = st.selectbox("Colormap (multi-curve series)", ["coolwarm", "viridis", "plasma", "turbo", "tab10"])
     cmap_heat = st.selectbox("Colormap (2D heatmaps)", ["inferno", "viridis", "magma", "RdYlBu_r", "plasma"])
     custom_legend_title = st.text_input("Custom legend title (multiparametric)", "")
@@ -622,6 +681,9 @@ plt.rcParams.update({
     "savefig.pad_inches": 0.1,
 })
 
+# Registry to collect all generated figures and CSV tables for bulk ZIP download
+EXPORT_REGISTRY = {}
+
 
 def style_legend(ax, title=None, loc="best", handles=None, labels=None):
     """Creates a legend where each text label matches the color of its line/marker."""
@@ -649,15 +711,22 @@ def style_ax(ax, xlabel, ylabel, title):
 
 
 def render_plot_with_download(fig, filename_base: str):
-    """Displays a Matplotlib figure with 600 DPI PNG and vector SVG download buttons."""
+    """Displays a Matplotlib figure, stores bytes in EXPORT_REGISTRY, and renders download buttons."""
     st.pyplot(fig, use_container_width=True)
-    c1, c2 = st.columns(2)
     buf_png = io.BytesIO()
     fig.savefig(buf_png, format="png", dpi=600)
-    c1.download_button("⬇️ PNG (600 DPI)", buf_png.getvalue(), f"{filename_base}.png", "image/png", key=f"png_{filename_base}")
+    png_bytes = buf_png.getvalue()
+
     buf_svg = io.BytesIO()
     fig.savefig(buf_svg, format="svg")
-    c2.download_button("⬇️ SVG (Vector)", buf_svg.getvalue(), f"{filename_base}.svg", "image/svg+xml", key=f"svg_{filename_base}")
+    svg_bytes = buf_svg.getvalue()
+
+    EXPORT_REGISTRY[f"figures_png/{filename_base}.png"] = png_bytes
+    EXPORT_REGISTRY[f"figures_svg/{filename_base}.svg"] = svg_bytes
+
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ PNG (600 DPI)", png_bytes, f"{filename_base}.png", "image/png", key=f"png_{filename_base}")
+    c2.download_button("⬇️ SVG (Vector)", svg_bytes, f"{filename_base}.svg", "image/svg+xml", key=f"svg_{filename_base}")
     plt.close(fig)
 
 
@@ -665,19 +734,25 @@ def render_plot_with_download(fig, filename_base: str):
 # 4. HEADER & WORKING POINT METRICS
 # =============================================================================
 st.title("⚡ Unified PCEC / PCFC Electro-, Mass-, and Heat-Transfer Model")
-st.caption(f"Electrolyte: **{preset_name}** | Solver: **{solver_label}** | Carriers: OH•, V••, O•")
 
 mat_tuple = tuple(sorted(mat_params.items()))
 res_pt = cached_single_point(
-    i_work, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
+    float(i_work), float(T_work), float(L_work), float(Rp_H), float(Rp_O),
+    float(p_H2_f), float(p_H2O_f), float(p_H2O_o), float(c_R_work),
     mat_tuple, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift
 )
 
+st.caption(
+    f"Electrolyte: **{preset_name}** | Active Solver: **{res_pt['solver_used']}** | Carriers: OH•, V••, O•"
+)
+
 if solver_mode == "bvp" and not res_pt["bvp_converged"]:
-    st.warning("1D BVP solver did not converge at this operating point (falling back to algebraic solution).")
+    st.warning("1D BVP solver did not converge at this operating point — metrics and plots reflect **Algebraic Fallback**.")
+elif solver_mode == "bvp" and res_pt["bvp_mesh_warn"]:
+    st.info("1D BVP adaptive mesh approached max_nodes (2000) due to steep boundary layers.")
 
 m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Mode", res_pt["mode"].split()[0])
+m1.metric("Mode / Solver", res_pt["mode"].split()[0], delta=res_pt["solver_used"])
 m2.metric("Cell Voltage (V)", f"{res_pt['V_cell']:.4f}", delta=f"E_eq = {res_pt['E_eq']:.3f} V")
 m3.metric("Faradaic Eff. (%)", f"{res_pt['FE']:.2f}%")
 m4.metric("LHV Efficiency (%)", f"{res_pt['eff_LHV']:.2f}%")
@@ -754,7 +829,7 @@ with tab1:
         ax.plot(x, np.log10(np.maximum(res_pt["p_O2_int"], 1e-35)), lw=lw, label=r"$\log_{10} p_{\mathrm{O_2}}$")
         ax.plot(x, np.log10(np.maximum(res_pt["p_H2O_int"], 1e-35)), lw=lw, label=r"$\log_{10} p_{\mathrm{H_2O}}$")
         ax.plot(x, np.log10(np.maximum(res_pt["p_H2_int"], 1e-35)), lw=lw, label=r"$\log_{10} p_{\mathrm{H_2}}$")
-        ax.axhline(0.0, color="gray", ls=":", lw=1.0, label="1 atm threshold")
+        ax.axhline(np.log10(pO2_crit_atm), color="crimson", ls=":", lw=1.1, label=f"Critical p(O₂) ({pO2_crit_atm} atm)")
         style_ax(ax, r"Normalized Coordinate ($x / L$)", r"$\log_{10}(p_i\ /\ \mathrm{atm})$", "Internal Gas Partial Pressures")
         style_legend(ax)
         render_plot_with_download(fig, "spatial_internal_pressures")
@@ -770,9 +845,12 @@ with tab2:
     n_pts = col_i3.slider("Sweep Points", 20, 80, 41)
 
     df_i = cached_iv_sweep(
-        i_min, i_max, n_pts, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
+        float(i_min), float(i_max), int(n_pts),
+        float(T_work), float(L_work), float(Rp_H), float(Rp_O),
+        float(p_H2_f), float(p_H2O_f), float(p_H2O_o), float(c_R_work),
         mat_tuple, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift
     )
+    EXPORT_REGISTRY["data_csv/iv_sweep_data.csv"] = df_i.to_csv(index=False).encode("utf-8")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -802,20 +880,29 @@ with tab2:
         style_legend(ax)
         render_plot_with_download(fig, "iv_partial_currents")
 
-        # Faradaic Efficiency and Mean Proton Transport Number
+        # All Three Transport Numbers (t_p, t_v, t_h) vs Current Density
         fig, ax = plt.subplots(figsize=(6, 4.2))
-        df_ec = df_i[df_i["i"] < -0.05]
-        df_fc_p = df_i[df_i["i"] > 0.05]
-        ax.plot(df_ec["i"], np.clip(df_ec["FE"], 0, 105), lw=lw, color="tab:blue", label="FE (PCEC)")
-        ax.plot(df_fc_p["i"], np.clip(df_fc_p["FE"], 0, 105), lw=lw, color="tab:green", label="FE (PCFC)")
-        ax.plot(df_i["i"], df_i["t_p"] * 100.0, lw=lw, ls="--", color="black", label=r"Mean $t_p$")
+        ax.plot(df_i["i"], df_i["t_p"] * 100.0, lw=lw, color="tab:blue", label=r"$t_p$ (protons)")
+        ax.plot(df_i["i"], df_i["t_h"] * 100.0, lw=lw, color="crimson", label=r"$t_h$ (polarons)")
+        ax.plot(df_i["i"], df_i["t_v"] * 100.0, lw=lw, color="tab:green", label=r"$t_v$ (vacancies)")
+        ax.axvline(0.0, color="black", ls=":", lw=0.8)
         ax.set_ylim(0, 105)
-        style_ax(ax, r"Current Density (A cm$^{-2}$)", "Efficiency / Transport Number (%)", "Faradaic Efficiency and Proton Transport Number")
+        style_ax(ax, r"Current Density (A cm$^{-2}$)", "Mean Transport Number (%)", "Partial Transport Numbers vs. Current Density")
         style_legend(ax)
-        render_plot_with_download(fig, "iv_FE_transport")
+        render_plot_with_download(fig, "iv_transport_numbers")
+
+        # Membrane Ohmic ASR vs Current Density
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(df_i["i"], df_i["ASR_ohm"], lw=lw, marker=mk, ms=ms, color="darkviolet", label=r"$\mathrm{ASR}_{\mathrm{ohm}}$")
+        ax.axvline(0.0, color="black", ls=":", lw=0.8)
+        style_ax(ax, r"Current Density (A cm$^{-2}$)", r"Membrane Ohmic ASR ($\Omega$ cm$^2$)", "Current-Dependent Membrane Ohmic Resistance")
+        style_legend(ax)
+        render_plot_with_download(fig, "iv_ASR_ohm")
 
         # Energy Efficiency (LHV)
         fig, ax = plt.subplots(figsize=(6, 4.2))
+        df_ec = df_i[df_i["i"] < -0.05]
+        df_fc_p = df_i[df_i["i"] > 0.05]
         ax.plot(df_ec["i"], np.clip(df_ec["eff_LHV"], 0, 105), lw=lw, color="teal", label="PCEC Efficiency (LHV)")
         ax.plot(df_fc_p["i"], np.clip(df_fc_p["eff_LHV"], 0, 105), lw=lw, color="purple", label="PCFC Efficiency (LHV)")
         ax.set_ylim(0, 105)
@@ -849,6 +936,25 @@ with tab2:
         style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
         render_plot_with_download(fig, "iv_leakage_analysis")
 
+        # Faradaic Efficiency
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(df_ec["i"], np.clip(df_ec["FE"], 0, 105), lw=lw, color="tab:blue", label="FE (PCEC)")
+        ax.plot(df_fc_p["i"], np.clip(df_fc_p["FE"], 0, 105), lw=lw, color="tab:green", label="FE (PCFC)")
+        ax.axvline(0.0, color="black", ls=":", lw=0.8)
+        ax.set_ylim(0, 105)
+        style_ax(ax, r"Current Density (A cm$^{-2}$)", "Faradaic Efficiency (%)", "Faradaic Efficiency in PCEC and PCFC Modes")
+        style_legend(ax)
+        render_plot_with_download(fig, "iv_FE")
+
+        # Peak Internal Oxygen Pressure vs Current Density (Delamination Risk)
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(df_i["i"], df_i["p_O2_max"], lw=lw, marker=mk, ms=ms, color="firebrick", label=r"$\max\,p_{\mathrm{O_2, int}}$")
+        ax.axhline(pO2_crit_atm, color="black", ls="--", lw=1.0, label=f"Critical threshold ({pO2_crit_atm} atm)")
+        ax.set_yscale("log")
+        style_ax(ax, r"Current Density (A cm$^{-2}$)", r"Peak Internal $p_{\mathrm{O_2}}$ (atm)", "Peak Internal Oxygen Pressure (Delamination Risk)")
+        style_legend(ax)
+        render_plot_with_download(fig, "iv_peak_pO2")
+
         # Thermal Balance
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(df_i["i"], df_i["q_dot"], lw=lw, color="darkorange", label=r"Heat flux ($\dot{q}$)")
@@ -859,10 +965,10 @@ with tab2:
         style_legend(ax)
         render_plot_with_download(fig, "iv_heat_balance")
 
-    st.download_button("📥 Download I–V Sweep Data (CSV)", df_i.to_csv(index=False).encode("utf-8"), "iv_sweep_data.csv", "text/csv")
+    st.download_button("📥 Download I–V Sweep Data (CSV)", EXPORT_REGISTRY["data_csv/iv_sweep_data.csv"], "iv_sweep_data.csv", "text/csv")
 
 # -----------------------------------------------------------------------------
-# TAB 3: MULTIPARAMETRIC ANALYSIS
+# TAB 3: MULTIPARAMETRIC ANALYSIS (FULLY CACHED)
 # -----------------------------------------------------------------------------
 with tab3:
     st.subheader("Multiparametric Sensitivity Analysis")
@@ -893,6 +999,8 @@ with tab3:
             float(p_H2_f), float(p_H2O_f), float(p_H2O_o), float(c_R_work),
             binary_fuel, mat_tuple, use_arcsinh_shift
         )
+        EXPORT_REGISTRY["data_csv/multiparametric_summary.csv"] = df_sum.to_csv(index=False).encode("utf-8")
+
         cmap = plt.get_cmap(cmap_multi)
         colors = [cmap(k / max(len(var_values) - 1, 1)) for k in range(len(var_values))]
         leg_title_use = custom_legend_title.strip() if custom_legend_title.strip() else var_label
@@ -903,7 +1011,7 @@ with tab3:
             # Family of Polarization Curves
             fig, ax = plt.subplots(figsize=(6, 4.2))
             for idx, val in enumerate(var_values):
-                df_v = multi_iv[val]
+                df_v = multi_iv[float(val)]
                 ax.plot(df_v["i"], df_v["V_cell"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
             ax.axvline(0, color="black", ls=":", lw=0.8)
             style_ax(ax, r"Current Density (A cm$^{-2}$)", "Cell Voltage (V)", f"Polarization Curves vs. {var_label}")
@@ -913,7 +1021,7 @@ with tab3:
             # Family of Electronic Leakage Current
             fig, ax = plt.subplots(figsize=(6, 4.2))
             for idx, val in enumerate(var_values):
-                df_v = multi_iv[val]
+                df_v = multi_iv[float(val)]
                 ax.plot(df_v["i"], df_v["i_h"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
             ax.axhline(0, color="black", ls=":", lw=0.8)
             ax.axvline(0, color="black", ls=":", lw=0.8)
@@ -925,7 +1033,7 @@ with tab3:
             # Family of Faradaic Efficiency
             fig, ax = plt.subplots(figsize=(6, 4.2))
             for idx, val in enumerate(var_values):
-                df_v = multi_iv[val]
+                df_v = multi_iv[float(val)]
                 df_ec_v = df_v[df_v["i"] < -0.05]
                 df_fc_v = df_v[df_v["i"] > 0.05]
                 ax.plot(df_ec_v["i"], np.clip(df_ec_v["FE"], 0, 105), lw=lw, color=colors[idx], label=p_cfg["fmt"].format(val))
@@ -938,7 +1046,7 @@ with tab3:
             # Family of PCFC Power Density
             fig, ax = plt.subplots(figsize=(6, 4.2))
             for idx, val in enumerate(var_values):
-                df_v = multi_iv[val]
+                df_v = multi_iv[float(val)]
                 df_fc_v = df_v[df_v["i"] >= 0]
                 ax.plot(df_fc_v["i"], df_fc_v["P_elec"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
             style_ax(ax, r"Current Density (A cm$^{-2}$)", r"Power Density (W cm$^{-2}$)", f"PCFC Power Density vs. {var_label}")
@@ -1004,15 +1112,22 @@ with tab3:
         with c2:
             # 2. Thermoneutral Current Density and Actual TN Voltage
             fig, ax = plt.subplots(figsize=(6, 4.0))
-            ax.plot(df_sum["param"], df_sum["i_TN"], lw=lw, marker="o", ms=ms, color="darkorange", label=r"$i_{\mathrm{TN}}$ (PCEC)")
-            style_ax(ax, var_label, r"Thermoneutral Current Density (A cm$^{-2}$)", "Thermoneutral Operating Point (PCEC)")
-            ax2 = ax.twinx()
-            ax2.plot(df_sum["param"], df_sum["V_TN_pt"], lw=lw, ls="--", marker="s", ms=ms, color="black", label=r"$V_{\mathrm{TN}}^{\mathrm{act}}$")
-            ax2.set_ylabel("Actual Thermoneutral Voltage (V)", color="black")
-            ax2.tick_params(axis="y", labelcolor="black", direction="in")
-            l1, lb1 = ax.get_legend_handles_labels()
-            l2, lb2 = ax2.get_legend_handles_labels()
-            style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
+            has_tn = df_sum["i_TN"].notna().any()
+            if has_tn:
+                ax.plot(df_sum["param"], df_sum["i_TN"], lw=lw, marker="o", ms=ms, color="darkorange", label=r"$i_{\mathrm{TN}}$ (PCEC)")
+                style_ax(ax, var_label, r"Thermoneutral Current Density (A cm$^{-2}$)", "Thermoneutral Operating Point (PCEC)")
+                ax2 = ax.twinx()
+                ax2.plot(df_sum["param"], df_sum["V_TN_pt"], lw=lw, ls="--", marker="s", ms=ms, color="black", label=r"$V_{\mathrm{TN}}^{\mathrm{act}}$")
+                ax2.set_ylabel("Actual Thermoneutral Voltage (V)", color="black")
+                ax2.tick_params(axis="y", labelcolor="black", direction="in")
+                l1, lb1 = ax.get_legend_handles_labels()
+                l2, lb2 = ax2.get_legend_handles_labels()
+                style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
+            else:
+                # Fallback: plot V_TN_act at working point if i_TN is beyond -100 A/cm^2
+                ax.plot(df_sum["param"], df_sum["V_TN_act_wk"], lw=lw, marker="s", ms=ms, color="black", label=r"$V_{\mathrm{TN}}^{\mathrm{act}}$ (at $i_{\mathrm{work}}$)")
+                style_ax(ax, var_label, "Actual Thermoneutral Voltage (V)", "Actual Thermoneutral Voltage (i_TN > 100 A/cm²)")
+                style_legend(ax)
             render_plot_with_download(fig, "mp_thermoneutral")
 
             # 4. Faradaic Efficiency & LHV Energy Efficiency
@@ -1051,17 +1166,17 @@ with tab3:
             style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
             render_plot_with_download(fig, "mp_heat_voltage")
 
-        st.download_button("📥 Download Multiparametric Summary (CSV)", df_sum.to_csv(index=False).encode("utf-8"), "multiparametric_summary.csv", "text/csv")
+        st.download_button("📥 Download Multiparametric Summary (CSV)", EXPORT_REGISTRY["data_csv/multiparametric_summary.csv"], "multiparametric_summary.csv", "text/csv")
 
 # -----------------------------------------------------------------------------
-# TAB 4: 2D HEATMAPS (CONTOUR MAPS)
+# TAB 4: 2D HEATMAPS (CONTOUR MAPS, FULLY CACHED)
 # -----------------------------------------------------------------------------
 with tab4:
     st.subheader("2D Parametric Heatmaps")
     res_hm = st.slider("Heatmap Grid Resolution (N × N)", 12, 35, 20)
 
-    T_hm, i_hm_ec, L_hm, x_hm, FE_map, Q_map, Eff_L_map, pO2_map = cached_heatmaps(
-        res_hm, float(T_work), float(L_work), float(Rp_H), float(Rp_O),
+    T_hm, i_hm_ec, L_hm, x_hm, FE_map, Q_map, Leak_map, Eff_L_map, pO2_map = cached_heatmaps(
+        int(res_hm), float(T_work), float(L_work), float(Rp_H), float(Rp_O),
         float(p_H2_f), float(p_H2O_f), float(p_H2O_o), float(c_R_work),
         mat_tuple, use_arcsinh_shift
     )
@@ -1078,15 +1193,25 @@ with tab4:
         style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", "Temperature (°C)", "Faradaic Efficiency Map")
         render_plot_with_download(fig, "heatmap_FE_Ti")
 
-        # Heatmap 3: Energy Efficiency(L, i)
+        # Heatmap 3: Electronic Leakage Map |i_h|(T, i)
         fig, ax = plt.subplots(figsize=(6, 4.4))
-        cf = ax.contourf(i_hm_ec, L_hm, Eff_L_map, levels=20, cmap=cmap_heat)
+        cf = ax.contourf(i_hm_ec, T_hm, Leak_map, levels=20, cmap=cmap_heat)
         if show_contours:
-            cs = ax.contour(i_hm_ec, L_hm, Eff_L_map, levels=8, colors="white", linewidths=0.7, alpha=0.85)
-            ax.clabel(cs, inline=True, fontsize=fs_tick - 1, fmt="%.0f%%")
-        fig.colorbar(cf, ax=ax, label="LHV Energy Efficiency (%)")
-        style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", "Electrolyte Thickness (µm)", f"Optimum Thickness Map ({T_work} °C)")
-        render_plot_with_download(fig, "heatmap_Eff_Li")
+            cs = ax.contour(i_hm_ec, T_hm, Leak_map, levels=8, colors="white", linewidths=0.7, alpha=0.85)
+            ax.clabel(cs, inline=True, fontsize=fs_tick - 1, fmt="%.0f")
+        fig.colorbar(cf, ax=ax, label=r"Electronic Leakage $|i_h|$ (mA cm$^{-2}$)")
+        style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", "Temperature (°C)", "Electronic Leakage Current Map")
+        render_plot_with_download(fig, "heatmap_leakage_Ti")
+
+        # Heatmap 5: Internal Oxygen Partial Pressure
+        fig, ax = plt.subplots(figsize=(6, 4.4))
+        cf = ax.contourf(i_hm_ec, x_hm, pO2_map, levels=20, cmap=cmap_heat)
+        if show_contours:
+            cs = ax.contour(i_hm_ec, x_hm, pO2_map, levels=6, colors="white", linewidths=0.7, alpha=0.85)
+            ax.clabel(cs, inline=True, fontsize=fs_tick - 1, fmt="%.1f")
+        fig.colorbar(cf, ax=ax, label=r"$\log_{10}(p_{\mathrm{O_2}}\ /\ \mathrm{atm})$")
+        style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", r"Normalized Coordinate ($x / L$)", f"Internal Oxygen Pressure Map ({T_work} °C)")
+        render_plot_with_download(fig, "heatmap_pO2_xi")
 
     with c2:
         # Heatmap 2: Thermal Balance q_dot(T, i)
@@ -1100,12 +1225,29 @@ with tab4:
         style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", "Temperature (°C)", "Thermal Balance and Thermoneutral Boundary")
         render_plot_with_download(fig, "heatmap_Q_Ti")
 
-        # Heatmap 4: Internal Oxygen Partial Pressure
+        # Heatmap 4: Energy Efficiency(L, i) — Optimum Thickness Map
         fig, ax = plt.subplots(figsize=(6, 4.4))
-        cf = ax.contourf(i_hm_ec, x_hm, pO2_map, levels=20, cmap=cmap_heat)
+        cf = ax.contourf(i_hm_ec, L_hm, Eff_L_map, levels=20, cmap=cmap_heat)
         if show_contours:
-            cs = ax.contour(i_hm_ec, x_hm, pO2_map, levels=6, colors="white", linewidths=0.7, alpha=0.85)
-            ax.clabel(cs, inline=True, fontsize=fs_tick - 1, fmt="%.1f")
-        fig.colorbar(cf, ax=ax, label=r"$\log_{10}(p_{\mathrm{O_2}}\ /\ \mathrm{atm})$")
-        style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", r"Normalized Coordinate ($x / L$)", f"Internal Oxygen Pressure Map ({T_work} °C)")
-        render_plot_with_download(fig, "heatmap_pO2_xi")
+            cs = ax.contour(i_hm_ec, L_hm, Eff_L_map, levels=8, colors="white", linewidths=0.7, alpha=0.85)
+            ax.clabel(cs, inline=True, fontsize=fs_tick - 1, fmt="%.0f%%")
+        fig.colorbar(cf, ax=ax, label="LHV Energy Efficiency (%)")
+        style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", "Electrolyte Thickness (µm)", f"Optimum Thickness Map ({T_work} °C)")
+        render_plot_with_download(fig, "heatmap_Eff_Li")
+
+# =============================================================================
+# 6. SIDEBAR BULK EXPORT (ALL FIGURES + CSV IN ONE ZIP)
+# =============================================================================
+st.sidebar.markdown("---")
+st.sidebar.subheader("📦 Bulk Export for Publication")
+if EXPORT_REGISTRY:
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path, data_bytes in EXPORT_REGISTRY.items():
+            zf.writestr(file_path, data_bytes)
+    st.sidebar.download_button(
+        label=f"⬇️ Download All ({len(EXPORT_REGISTRY)} files, ZIP)",
+        data=zip_buf.getvalue(),
+        file_name="pcec_pcfc_publication_bundle.zip",
+        mime="application/zip",
+    )
