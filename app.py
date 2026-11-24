@@ -289,7 +289,7 @@ def solve_single_point(
 
     # Membrane Ohmic ASR (Ohm cm^2) integrated across thickness
     L_cm = L_um * 1e-4
-    ASR_ohm = float(np.trapz(1.0 / np.maximum(sig_tot_prof, 1e-15), x_norm) * L_cm)
+    ASR_ohm = float(np.trapezoid(1.0 / np.maximum(sig_tot_prof, 1e-15), x_norm) * L_cm)
 
     # Spatial polaron leakage current components (A/cm^2)
     x_m = x_norm * L_m
