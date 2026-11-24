@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 # NumPy 1.x / 2.x trapezoidal integration compatibility
-_trapz = getattr(np, "trapezoid", np.trapz)
+_trapz = np.trapezoid if hasattr(np, "trapezoid") else getattr(np, "trapz")
 
 R_GAS = 8.314462618      # J / (mol * K)
 F_CONST = 96485.33212    # C / mol
