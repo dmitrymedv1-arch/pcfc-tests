@@ -388,21 +388,25 @@ def find_special_points(T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, ma
     except ValueError:
         i_trans = np.nan
 
+
     # 2. Thermoneutral current density in PCEC (where q_dot = 0, i < 0)
     def q_func(iv):
         return solve_single_point(iv, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)["q_dot"]
 
     i_TN, V_TN_pt = np.nan, np.nan
     try:
-        # Check sign change in PCEC region
-        q_lo, q_hi = q_func(-3.5), q_func(-0.05)
-        if q_lo * q_hi < 0:
-            i_TN = brentq(q_func, -3.5, -0.05, xtol=1e-4)
-            r_tn = solve_single_point(i_TN, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)
-            V_TN_pt = r_tn["V_cell"]
+        # Adaptive search for sign change in PCEC region down to -20 A/cm^2
+        i_hi_tn = -0.05
+        q_hi = q_func(i_hi_tn)
+        for i_lo_tn in [-1.5, -3.5, -7.0, -12.0, -20.0]:
+            q_lo = q_func(i_lo_tn)
+            if q_lo * q_hi < 0:
+                i_TN = brentq(q_func, i_lo_tn, i_hi_tn, xtol=1e-4)
+                r_tn = solve_single_point(i_TN, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)
+                V_TN_pt = r_tn["V_cell"]
+                break
     except ValueError:
         pass
-
     # 3. Maximum power density in PCFC (i > 0)
     i_fc_scan = np.linspace(0.05, 2.5, 25)
     p_vals = []
