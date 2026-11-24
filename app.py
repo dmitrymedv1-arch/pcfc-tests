@@ -328,7 +328,7 @@ def solve_newton_sparse(y0_flat, icg, bc_H, bc_O, params, tol=1e-10, max_iter=40
 @st.cache_data(show_spinner=False)
 def solve_transport_steady(
     icu, Temp, Thick, RpH, RpH2O, Phh2o, Phh2, Psh2o, Pso2, Cd, P_tuple,
-    num_grid=200, n_continuation_steps=3
+    num_grid=200, n_continuation_steps=5
 ):
     """
     Решает стационарную 1D задачу электрохимического переноса в электролите.
@@ -385,7 +385,7 @@ def solve_transport_steady(
         bc_O = compute_boundary_concentrations('oxygen', ic_step, Temp, RpH2O, 0.0, Psh2o, Pso2, Cd, params)
 
         y_flat, max_res, it_step = solve_newton_sparse(
-            y_curr.ravel(), icg_step, bc_H, bc_O, params, tol=1e-10, max_iter=40
+            y_curr.ravel(), icg_step, bc_H, bc_O, params, tol=1e-10, max_iter=80
         )
         total_iters += it_step
         y_curr = y_flat.reshape((num_grid, 4))
