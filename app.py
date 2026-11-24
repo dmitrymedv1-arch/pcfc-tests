@@ -1,14 +1,13 @@
-import io
-from dataclasses import dataclass
+import ioimport io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import brentq
-from scipy.integrate import solve_bvp, trapezoid
+from scipy.integrate import solve_bvp
 import streamlit as st
 
 # =============================================================================
-# 1. PAGE CONFIGURATION & UNIVERSAL PHYSICAL CONSTANTS
+# 1. PAGE CONFIGURATION & PHYSICAL CONSTANTS
 # =============================================================================
 st.set_page_config(
     page_title="PCEC / PCFC Multiphysics Membrane Model",
@@ -18,110 +17,75 @@ st.set_page_config(
 
 R_GAS = 8.314462618      # J / (mol * K)
 F_CONST = 96485.33212    # C / mol
-# Gas-phase steam formation (H2 + 0.5 O2 <-> H2O(g)) at ~600 C (Thatte 2024; Moranti 2026)
-DH_W = -248110.0         # J / mol
+DH_W = -248110.0         # J / mol (H2 + 0.5 O2 <-> H2O, 500-700 C)
 DS_W = -55.48            # J / (mol * K)
-LHV_H2 = 241800.0        # J / mol (at 25 C, for LHV efficiency definition)
-V_MOLAR_STP = 22414.0    # Nml / mol (0 C, 1 atm)
+LHV_H2 = 241800.0        # J / mol (at 25 C)
+V_MOLAR_STP = 22414.0    # Nml / mol (at 0 C, 1 atm)
 
-
-@dataclass(frozen=True)
-class MaterialParams:
-    name: str
-    Vm: float
-    dH_H2O: float
-    dS_H2O: float
-    dH_O2: float
-    dS_O2: float
-    D0_p: float
-    E_p: float
-    D0_v: float
-    E_v: float
-    D0_h: float
-    E_h: float
-    default_cR: float
-    reference: str
-
-
+# Electrolyte material presets (Thatte 2024, Restrepo 2026, Moranti 2026)
 MATERIAL_PRESETS = {
-    "BCZYYb7111 (Thatte 2024 / Restrepo 2026)": MaterialParams(
-        name="BCZYYb7111", Vm=5.13e-5,
-        dH_H2O=-93300.0, dS_H2O=-100.0,
-        dH_O2=114880.0, dS_O2=-45.89,
-        D0_p=1.02e-7, E_p=42650.0,
-        D0_v=1.73e-7, E_v=59700.0,
-        D0_h=2.41e-5, E_h=8400.0,
-        default_cR=0.20,
-        reference="J. Power Sources 611 (2024) 234706; Appl. Energy 420 (2026) 128115"
-    ),
-    "BZY20 (Moranti 2026)": MaterialParams(
-        name="BZY20", Vm=4.57e-5,
-        dH_H2O=-93300.0, dS_H2O=-100.0,
-        dH_O2=115310.0, dS_O2=-45.89,
-        D0_p=5.18e-7, E_p=60660.0,
-        D0_v=2.03e-7, E_v=85190.0,
-        D0_h=1.38e-5, E_h=7180.0,
-        default_cR=0.20,
-        reference="J. Power Sources 663 (2026) 238898"
-    ),
-    "BCZY652015 (Moranti 2026)": MaterialParams(
-        name="BCZY652015", Vm=4.57e-5,
-        dH_H2O=-123000.0, dS_H2O=-130.95,
-        dH_O2=132570.0, dS_O2=-119.93,
-        D0_p=1.63e-7, E_p=47190.0,
-        D0_v=1.36e-7, E_v=68060.0,
-        D0_h=2.50e-3, E_h=9730.0,
-        default_cR=0.15,
-        reference="J. Power Sources 663 (2026) 238898"
-    ),
+    "BCZYYb7111 (Thatte 2024 / Restrepo 2026)": {
+        "Vm": 5.13e-5,
+        "dH_H2O": -93300.0,  "dS_H2O": -100.0,
+        "dH_O2":  114880.0,  "dS_O2":  -45.89,
+        "D0_p": 1.02e-7,     "E_p": 42650.0,
+        "D0_v": 1.73e-7,     "E_v": 59700.0,
+        "D0_h": 2.41e-5,     "E_h": 8400.0,
+        "default_cR": 0.20,
+    },
+    "BZY20 (Moranti 2026)": {
+        "Vm": 4.57e-5,
+        "dH_H2O": -93300.0,  "dS_H2O": -100.0,
+        "dH_O2":  115310.0,  "dS_O2":  -45.89,
+        "D0_p": 5.18e-7,     "E_p": 60660.0,
+        "D0_v": 2.03e-7,     "E_v": 85190.0,
+        "D0_h": 1.38e-5,     "E_h": 7180.0,
+        "default_cR": 0.20,
+    },
+    "BCZY652015 (Moranti 2026)": {
+        "Vm": 4.57e-5,
+        "dH_H2O": -123000.0, "dS_H2O": -130.95,
+        "dH_O2":  132570.0,  "dS_O2":  -119.93,
+        "D0_p": 1.63e-7,     "E_p": 47190.0,
+        "D0_v": 1.36e-7,     "E_v": 68060.0,
+        "D0_h": 2.50e-3,     "E_h": 9730.0,
+        "default_cR": 0.15,
+    },
 }
 
 
 # =============================================================================
 # 2. PHYSICS ENGINE (3 MOBILE CARRIERS: p=OH_O*, v=V_O**, h=O_O*)
 # =============================================================================
-def get_material_props(T_K: float, mat: MaterialParams):
+def get_material_props(T_K: float, mat: dict):
     """Returns equilibrium constants and defect diffusivities at T_K."""
     K_W = np.exp(DS_W / R_GAS - DH_W / (R_GAS * T_K))
-    K_H2O = np.exp(mat.dS_H2O / R_GAS - mat.dH_H2O / (R_GAS * T_K))
-    K_O2 = np.exp(mat.dS_O2 / R_GAS - mat.dH_O2 / (R_GAS * T_K))
-    D_p = mat.D0_p * np.exp(-mat.E_p / (R_GAS * T_K))
-    D_v = mat.D0_v * np.exp(-mat.E_v / (R_GAS * T_K))
-    D_h = mat.D0_h * np.exp(-mat.E_h / (R_GAS * T_K))
+    K_H2O = np.exp(mat["dS_H2O"] / R_GAS - mat["dH_H2O"] / (R_GAS * T_K))
+    K_O2 = np.exp(mat["dS_O2"] / R_GAS - mat["dH_O2"] / (R_GAS * T_K))
+    D_p = mat["D0_p"] * np.exp(-mat["E_p"] / (R_GAS * T_K))
+    D_v = mat["D0_v"] * np.exp(-mat["E_v"] / (R_GAS * T_K))
+    D_h = mat["D0_h"] * np.exp(-mat["E_h"] / (R_GAS * T_K))
     return K_W, K_H2O, K_O2, D_p, D_v, D_h
 
 
 def solve_boundary_defects(p_H2O: float, p_O2: float, c_R: float, K_H2O: float, K_O2: float):
     """
-    Exact analytical solution of defect equilibrium at a boundary
-    (3 mobile defects + O_O^x = 3, electroneutrality p + 2v + h = c_R).
-    Reduces strictly to a quadratic equation in v in (0, c_R/2).
+    Exact solution of defect equilibrium at a boundary (3 mobile defects + O_O^x = 3).
+    Returns dimensionless formula-unit concentrations [OH_O*]_L, [V_O**]_L, [O_O*]_L, [O_O^x]_L.
     """
     p_H2O = max(p_H2O, 1e-18)
     p_O2 = max(p_O2, 1e-35)
 
     alpha = np.sqrt((K_O2 * np.sqrt(p_O2)) / (K_H2O * p_H2O))
     denom = 1.0 + alpha
-    K_eff = K_H2O * p_H2O * (denom ** 2)
 
-    # Equation: (c_R - 2v)^2 = K_eff * v * (3 - c_R + v)
-    # => (4 - K_eff) * v^2 - (4*c_R + K_eff*(3 - c_R)) * v + c_R^2 = 0
-    A = 4.0 - K_eff
-    B = -(4.0 * c_R + K_eff * (3.0 - c_R))
-    C = c_R ** 2
+    def residual(v):
+        p = (c_R - 2.0 * v) / denom
+        o = 3.0 - c_R + v
+        return p * p - K_H2O * p_H2O * v * o
 
     v_max = 0.5 * c_R
-    if abs(A) < 1e-12:
-        v_sol = -C / B
-    else:
-        disc = max(B * B - 4.0 * A * C, 0.0)
-        sqrt_disc = np.sqrt(disc)
-        r1 = (-B - sqrt_disc) / (2.0 * A)
-        r2 = (-B + sqrt_disc) / (2.0 * A)
-        candidates = [r for r in (r1, r2) if 0.0 <= r <= v_max * (1.0 + 1e-12)]
-        v_sol = min(candidates, key=lambda x: abs(x - 0.5 * v_max)) if candidates else np.clip(r1, 1e-18, v_max * (1.0 - 1e-15))
-
-    v_sol = float(np.clip(v_sol, 1e-18 * v_max, v_max * (1.0 - 1e-15)))
+    v_sol = brentq(residual, 1e-18 * v_max, v_max * (1.0 - 1e-15), xtol=1e-14, rtol=1e-13)
     p_sol = (c_R - 2.0 * v_sol) / denom
     h_sol = alpha * p_sol
     o_sol = 3.0 - c_R + v_sol
@@ -129,21 +93,15 @@ def solve_boundary_defects(p_H2O: float, p_O2: float, c_R: float, K_H2O: float, 
 
 
 def bernoulli_flux(u: float, c_f: float, c_o: float) -> float:
-    """
-    Numerically stable evaluation of u * (c_o - c_f * exp(-u)) / (1 - exp(-u))
-    written via dc = c_o - c_f and c_bar = 0.5*(c_o + c_f) to avoid cancellation.
-    """
-    dc = c_o - c_f
-    c_bar = 0.5 * (c_o + c_f)
-    if abs(u) < 1e-5:
-        u2 = u * u
-        return dc * (1.0 + u2 / 12.0 - (u2 * u2) / 720.0) + u * c_bar
+    """Numerically stable evaluation of u * (c_o - c_f * exp(-u)) / (1 - exp(-u))."""
+    if abs(u) < 1e-6:
+        return (c_o - c_f) + 0.5 * u * (c_o + c_f) + (u * u / 12.0) * (c_o - c_f)
     elif u > 0:
         eu = np.exp(-u)
-        return u * (dc + c_f * (1.0 - eu)) / (1.0 - eu)
+        return u * (c_o - c_f * eu) / (1.0 - eu)
     else:
         eu = np.exp(u)
-        return u * (dc * eu - c_f * (1.0 - eu)) / (eu - 1.0)
+        return u * (c_o * eu - c_f) / (eu - 1.0)
 
 
 def profile_exp(x_norm: np.ndarray, u: float, c_f: float, c_o: float) -> np.ndarray:
@@ -171,7 +129,6 @@ def compute_gas_fluxes(J_p, J_v, p_H2_f, p_H2O_f, p_O2_f):
     return J_H2, J_H2O, J_O2
 
 
-@st.cache_data(show_spinner=False)
 def solve_single_point(
     i_A_cm2: float,
     T_C: float,
@@ -182,18 +139,18 @@ def solve_single_point(
     p_H2O_f: float,
     p_H2O_o: float,
     c_R: float,
-    mat: MaterialParams,
+    mat: dict,
     solver_mode: str = "fast",
     use_arcsinh_shift: bool = True,
     n_grid: int = 80,
 ):
     """
     Unified 1D solver for PCFC (i > 0), OCV (i = 0), and PCEC (i < 0).
-    Cached via @st.cache_data for fast interactive exploration.
+    Returns a dictionary of scalar metrics and 1D spatial profiles across x/L.
     """
     T_K = T_C + 273.15
     L_m = L_um * 1e-6
-    Vm = mat.Vm
+    Vm = mat["Vm"]
     i_A_m2 = i_A_cm2 * 1e4  # A/m^2
 
     K_W, K_H2O, K_O2, D_p, D_v, D_h = get_material_props(T_K, mat)
@@ -214,7 +171,7 @@ def solve_single_point(
     eta_H = (R_GAS * T_K / F_CONST) * np.arcsinh((i_A_cm2 * Rp_H * F_CONST) / (R_GAS * T_K)) if Rp_H > 0 else 0.0
     eta_O = (R_GAS * T_K / F_CONST) * np.arcsinh((i_A_cm2 * Rp_O * F_CONST) / (R_GAS * T_K)) if Rp_O > 0 else 0.0
 
-    # Phenomenological boundary concentration shift via effective p_O2
+    # Boundary concentration shift via effective p_O2 (guarantees positive concentrations)
     if use_arcsinh_shift and (Rp_H > 0 or Rp_O > 0):
         shift_f = np.clip(4.0 * F_CONST * eta_H / (R_GAS * T_K), -25.0, 25.0)
         shift_o = np.clip(-4.0 * F_CONST * eta_O / (R_GAS * T_K), -25.0, 25.0)
@@ -253,9 +210,9 @@ def solve_single_point(
     x_norm = np.linspace(0.0, 1.0, n_grid)
     cp_prof = profile_exp(x_norm, u1_alg, pf, po)
     cv_prof = profile_exp(x_norm, u2_alg, vf, vo)
-    ch_prof = np.maximum(c_R - cp_prof - 2.0 * cv_prof, 1e-18)
+    ch_prof = profile_exp(x_norm, u1_alg, hf, ho)
     Phi_prof = dPhi_alg * x_norm
-    dPhi_dx_prof = np.full_like(x_norm, dPhi_alg / L_m)
+    dPhi_dx_prof = np.full_like(x_norm, dPhi_alg / L_m)  # V/m
     E_field_prof = -dPhi_dx_prof
 
     J_p = -(D_p / L_m) * bernoulli_flux(u1_alg, cf_p, co_p)
@@ -263,84 +220,55 @@ def solve_single_point(
     J_h = -(D_h / L_m) * bernoulli_flux(u1_alg, cf_h, co_h)
     bvp_converged = True
 
-    # --- STEP 2: EXACT 1D BVP SOLVER (NEWMAN ELECTRONEUTRALITY + VARIABLE FIELD) ---
-    # Eliminates artificial eps_reg; enforces exact local electroneutrality c_h = c_R - c_p - 2*c_v
-    # and computes variable dPhi/dx from total current conservation sum(z_k J_k) = i_nd.
+    # --- STEP 2: EXACT 1D BVP SOLVER (VARIABLE FIELD + POISSON) ---
     if solver_mode == "bvp":
         Dp_nd = 1.0
         Dv_nd = D_v / D_p
         Dh_nd = D_h / D_p
         i_nd = i_A_m2 * L_m * Vm / (D_p * F_CONST)
+        eps_reg = max(100.0 * Vm * R_GAS * T_K / (F_CONST ** 2 * L_m ** 2), 1e-4)
 
         Jp_nd0 = J_p * L_m * Vm / D_p
         Jv_nd0 = J_v * L_m * Vm / D_p
+        Jh_nd0 = J_h * L_m * Vm / D_p
 
         def ode_rhs(x, y):
-            # y = [cp, cv, Jp_nd, Jv_nd, Phi_nd]
-            cp, cv, Jp_n, Jv_n, Phi_n = y
-            ch = np.maximum(c_R - cp - 2.0 * cv, 1e-18)
-            # From electroneutrality: dch/dx = -dcp/dx - 2*dcv/dx
-            # Total current conservation: Jp_n + 2*Jv_n + Jh_n = i_nd => Jh_n = i_nd - Jp_n - 2*Jv_n
-            Jh_n = i_nd - Jp_n - 2.0 * Jv_n
-            # Diffusive + migration balance yields exact variable field dPhi_n/dx:
-            # -(Dp*dcp + 2*Dv*dcv + Dh*dch) = i_nd + (Dp*cp + 4*Dv*cv + Dh*ch)*dPhi_n
-            # Substituting dch = -dcp - 2*dcv:
-            # (Dh - Dp)*dcp + 2*(Dh - Dv)*dcv = i_nd + sigma_nd * dPhi_n
-            # Using Nernst-Planck for dcp and dcv:
-            # dcp = -Jp_n/Dp - cp*dPhi_n ; dcv = -Jv_n/Dv - 2*cv*dPhi_n
-            sigma_nd = Dp_nd * cp + 4.0 * Dv_nd * cv + Dh_nd * ch
-            diff_term = (
-                (Dp_nd - Dh_nd) * (Jp_n / Dp_nd)
-                + 2.0 * (Dv_nd - Dh_nd) * (Jv_n / Dv_nd)
-                + Jh_n
-            )
-            # Equivalent direct identity:
-            # sum z_k J_k = -sum z_k D_k dc_k/dx - sigma_nd * dPhi_n = i_nd
-            # => dPhi_n = -(i_nd + (Dp - Dh)*(-Jp_n/Dp) + 2*(Dv - Dh)*(-Jv_n/Dv)) / (sigma_nd - (Dp-Dh)*cp - 4*(Dv-Dh)*cv)
-            denom_phi = Dh_nd * (cp + 4.0 * cv + ch)
-            num_phi = -(
-                i_nd
-                - (Dp_nd - Dh_nd) * (Jp_n / Dp_nd)
-                - 2.0 * (Dv_nd - Dh_nd) * (Jv_n / Dv_nd)
-            )
-            dPhi_n = num_phi / np.maximum(denom_phi, 1e-18)
-
+            cp, cv, ch, Jp_n, Jv_n, Jh_n, Phi_n, dPhi_n = y
             dcp = -Jp_n / Dp_nd - 1.0 * cp * dPhi_n
             dcv = -Jv_n / Dv_nd - 2.0 * cv * dPhi_n
+            dch = -Jh_n / Dh_nd - 1.0 * ch * dPhi_n
             zeros = np.zeros_like(x)
-            return np.vstack([dcp, dcv, zeros, zeros, dPhi_n])
+            d2Phi = -(cp + 2.0 * cv + ch - c_R) / eps_reg
+            return np.vstack([dcp, dcv, dch, zeros, zeros, zeros, dPhi_n, d2Phi])
 
         def bc_func(ya, yb):
             return np.array([
-                ya[0] - pf, ya[1] - vf,
-                yb[0] - po, yb[1] - vo,
-                ya[4] - 0.0,
+                ya[0] - pf, ya[1] - vf, ya[2] - hf,
+                yb[0] - po, yb[1] - vo, yb[2] - ho,
+                ya[6] - 0.0,
+                (yb[3] + 2.0 * yb[4] + yb[5]) - i_nd,
             ])
 
         y_init = np.vstack([
-            cp_prof, cv_prof,
+            cp_prof, cv_prof, ch_prof,
             np.full_like(x_norm, Jp_nd0),
             np.full_like(x_norm, Jv_nd0),
+            np.full_like(x_norm, Jh_nd0),
             u1_alg * x_norm,
+            np.full_like(x_norm, u1_alg),
         ])
 
-        sol = solve_bvp(ode_rhs, bc_func, x_norm, y_init, tol=1e-5, max_nodes=2000)
+        sol = solve_bvp(ode_rhs, bc_func, x_norm, y_init, tol=1e-4, max_nodes=1500)
         if sol.success:
             y_sol = sol.sol(x_norm)
             cp_prof = np.maximum(y_sol[0], 1e-18)
             cv_prof = np.maximum(y_sol[1], 1e-18)
-            ch_prof = np.maximum(c_R - cp_prof - 2.0 * cv_prof, 1e-18)
-            Jp_nd_sol = float(np.mean(y_sol[2]))
-            Jv_nd_sol = float(np.mean(y_sol[3]))
-            Jh_nd_sol = i_nd - Jp_nd_sol - 2.0 * Jv_nd_sol
-
-            J_p = Jp_nd_sol * D_p / (L_m * Vm)
-            J_v = Jv_nd_sol * D_p / (L_m * Vm)
-            J_h = Jh_nd_sol * D_p / (L_m * Vm)
-
-            Phi_prof = y_sol[4] * (R_GAS * T_K / F_CONST)
-            dPhi_n_prof = ode_rhs(x_norm, y_sol)[4]
-            dPhi_dx_prof = dPhi_n_prof * (R_GAS * T_K / (F_CONST * L_m))
+            ch_prof = np.maximum(y_sol[2], 1e-18)
+            J_p = float(np.mean(y_sol[3])) * D_p / (L_m * Vm)
+            J_v = float(np.mean(y_sol[4])) * D_p / (L_m * Vm)
+            J_h = float(np.mean(y_sol[5])) * D_p / (L_m * Vm)
+            Phi_prof = y_sol[6] * (R_GAS * T_K / F_CONST)
+            dPhi_dx_prof = y_sol[7] * (R_GAS * T_K / (F_CONST * L_m))
             E_field_prof = -dPhi_dx_prof
             dPhi_final = float(Phi_prof[-1] - Phi_prof[0])
         else:
@@ -361,7 +289,7 @@ def solve_single_point(
 
     # Membrane Ohmic ASR (Ohm cm^2) integrated across thickness
     L_cm = L_um * 1e-4
-    ASR_ohm = float(trapezoid(1.0 / np.maximum(sig_tot_prof, 1e-15), x_norm) * L_cm)
+    ASR_ohm = float(np.trapezoid(1.0 / np.maximum(sig_tot_prof, 1e-15), x_norm) * L_cm)
 
     # Spatial polaron leakage current components (A/cm^2)
     x_m = x_norm * L_m
@@ -430,7 +358,6 @@ def solve_single_point(
     return {
         "mode": mode_str,
         "bvp_converged": bvp_converged,
-        "p_O2_f": p_O2_f,
         "T_C": T_C, "i": i_tot, "V_cell": V_cell, "E_eq": E_eq,
         "dPhi": dPhi_final, "eta_H": eta_H, "eta_O": eta_O,
         "i_p": i_p, "i_v": i_v, "i_h": i_h, "r_leak": r_leak,
@@ -450,16 +377,11 @@ def solve_single_point(
     }
 
 
-@st.cache_data(show_spinner=False)
-def find_special_points(
-    T_C: float, L_um: float, Rp_H: float, Rp_O: float,
-    p_H2_f: float, p_H2O_f: float, p_H2O_o: float, c_R: float,
-    mat: MaterialParams, use_arcsinh_shift: bool
-):
-    """Finds P_max (PCFC), i_TN & V_TN_act (PCEC), and i_PCFC_to_PCEC without redundant calls."""
+def find_special_points(T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, use_arcsinh_shift):
+    """Finds P_max (PCFC), i_TN & V_TN_act (PCEC), and i_PCFC_to_PCEC."""
     # 1. Transition current density i_PCFC->PCEC (where i_p = 0)
     def ip_func(iv):
-        return solve_single_point(float(iv), T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)["i_p"]
+        return solve_single_point(iv, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)["i_p"]
 
     try:
         i_trans = brentq(ip_func, -0.8, 0.2, xtol=1e-4)
@@ -467,27 +389,22 @@ def find_special_points(
         i_trans = np.nan
 
     # 2. Thermoneutral current density in PCEC (where q_dot = 0, i < 0)
-    last_tn_res = {}
     def q_func(iv):
-        r = solve_single_point(float(iv), T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)
-        last_tn_res["r"] = r
-        return r["q_dot"]
+        return solve_single_point(iv, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)["q_dot"]
 
     i_TN, V_TN_pt = np.nan, np.nan
     try:
-        i_hi_tn = -0.05
-        q_hi = q_func(i_hi_tn)
-        for i_lo_tn in [-1.5, -3.5, -7.0, -12.0, -20.0]:
-            q_lo = q_func(i_lo_tn)
-            if q_lo * q_hi < 0:
-                i_TN = brentq(q_func, i_lo_tn, i_hi_tn, xtol=1e-4)
-                V_TN_pt = last_tn_res["r"]["V_cell"]
-                break
+        # Check sign change in PCEC region
+        q_lo, q_hi = q_func(-3.5), q_func(-0.05)
+        if q_lo * q_hi < 0:
+            i_TN = brentq(q_func, -3.5, -0.05, xtol=1e-4)
+            r_tn = solve_single_point(i_TN, T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)
+            V_TN_pt = r_tn["V_cell"]
     except ValueError:
         pass
 
     # 3. Maximum power density in PCFC (i > 0)
-    i_fc_scan = np.linspace(0.05, 4.0, 35)
+    i_fc_scan = np.linspace(0.05, 2.5, 25)
     p_vals = []
     for iv in i_fc_scan:
         r = solve_single_point(float(iv), T_C, L_um, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R, mat, "fast", use_arcsinh_shift, 15)
@@ -505,12 +422,12 @@ def find_special_points(
 st.sidebar.title("⚙️ Model Parameters")
 
 preset_name = st.sidebar.selectbox("Electrolyte Material", list(MATERIAL_PRESETS.keys()))
-base_mat = MATERIAL_PRESETS[preset_name]
+mat_params = dict(MATERIAL_PRESETS[preset_name])
 
 with st.sidebar.expander("🔬 Solver & Boundary Conditions", expanded=True):
     solver_label = st.radio(
         "NPP Solver Mode",
-        ["Fast (Algebraic, Constant Field)", "Exact (1D BVP, Newman Electroneutrality)"],
+        ["Fast (Algebraic, Constant Field)", "Exact (1D BVP, Variable Field)"],
         index=0,
     )
     solver_mode = "fast" if "Fast" in solver_label else "bvp"
@@ -524,7 +441,7 @@ with st.sidebar.expander("⚡ Operating & Geometric Parameters", expanded=True):
     i_work = st.number_input("Current density i (A cm⁻²) [<0 PCEC, >0 PCFC]", -2.5, 2.5, -0.8, 0.05, format="%.2f")
     T_work = st.slider("Temperature T (°C)", 450, 750, 600, 5)
     L_work = st.number_input("Electrolyte thickness L (µm)", 1.0, 500.0, 10.0, 1.0)
-    c_R_work = st.slider("Acceptor dopant concentration c_R (-)", 0.10, 0.30, float(base_mat.default_cR), 0.01, key=f"cR_{preset_name}")
+    c_R_work = st.slider("Acceptor dopant concentration c_R (-)", 0.10, 0.30, float(mat_params["default_cR"]), 0.01)
     col_rp1, col_rp2 = st.columns(2)
     Rp_H = col_rp1.number_input("Rp(H₂) (Ω cm²)", 0.0, 2.0, 0.05, 0.01, format="%.3f")
     Rp_O = col_rp2.number_input("Rp(O₂) (Ω cm²)", 0.0, 2.0, 0.05, 0.01, format="%.3f")
@@ -541,24 +458,12 @@ with st.sidebar.expander("💨 Electrode Gas Compositions (atm)", expanded=True)
     st.caption(f"Air/steam electrode p(O₂) = {0.21 * (1.0 - p_H2O_o):.4f} atm")
 
 with st.sidebar.expander("🧪 Custom Material Overrides", expanded=False):
-    st.caption(f"Ref: {base_mat.reference}")
-    ov_dH_H2O = st.number_input("ΔH°(H₂O) (J mol⁻¹)", value=float(base_mat.dH_H2O), step=1000.0, key=f"dH_H2O_{preset_name}")
-    ov_dS_H2O = st.number_input("ΔS°(H₂O) (J mol⁻¹ K⁻¹)", value=float(base_mat.dS_H2O), step=1.0, key=f"dS_H2O_{preset_name}")
-    ov_dH_O2 = st.number_input("ΔH°(O₂) (J mol⁻¹)", value=float(base_mat.dH_O2), step=1000.0, key=f"dH_O2_{preset_name}")
-    ov_dS_O2 = st.number_input("ΔS°(O₂) (J mol⁻¹ K⁻¹)", value=float(base_mat.dS_O2), step=1.0, key=f"dS_O2_{preset_name}")
-    ov_E_p = st.number_input("E_act(OH•) (J mol⁻¹)", value=float(base_mat.E_p), step=500.0, key=f"E_p_{preset_name}")
-    ov_E_h = st.number_input("E_act(O•) (J mol⁻¹)", value=float(base_mat.E_h), step=500.0, key=f"E_h_{preset_name}")
-
-mat_params = MaterialParams(
-    name=base_mat.name, Vm=base_mat.Vm,
-    dH_H2O=ov_dH_H2O, dS_H2O=ov_dS_H2O,
-    dH_O2=ov_dH_O2, dS_O2=ov_dS_O2,
-    D0_p=base_mat.D0_p, E_p=ov_E_p,
-    D0_v=base_mat.D0_v, E_v=base_mat.E_v,
-    D0_h=base_mat.D0_h, E_h=ov_E_h,
-    default_cR=base_mat.default_cR,
-    reference=base_mat.reference
-)
+    mat_params["dH_H2O"] = st.number_input("ΔH°(H₂O) (J mol⁻¹)", value=float(mat_params["dH_H2O"]), step=1000.0)
+    mat_params["dS_H2O"] = st.number_input("ΔS°(H₂O) (J mol⁻¹ K⁻¹)", value=float(mat_params["dS_H2O"]), step=1.0)
+    mat_params["dH_O2"] = st.number_input("ΔH°(O₂) (J mol⁻¹)", value=float(mat_params["dH_O2"]), step=1000.0)
+    mat_params["dS_O2"] = st.number_input("ΔS°(O₂) (J mol⁻¹ K⁻¹)", value=float(mat_params["dS_O2"]), step=1.0)
+    mat_params["E_p"] = st.number_input("E_act(OH•) (J mol⁻¹)", value=float(mat_params["E_p"]), step=500.0)
+    mat_params["E_h"] = st.number_input("E_act(O•) (J mol⁻¹)", value=float(mat_params["E_h"]), step=500.0)
 
 with st.sidebar.expander("🎨 Publication Plot Settings", expanded=False):
     fs_label = st.slider("Axis label font size", 8, 18, 11)
@@ -607,8 +512,7 @@ def style_legend(ax, title=None, loc="best", handles=None, labels=None):
     else:
         leg = ax.legend(title=title, loc=loc)
     if leg is not None:
-        leg_handles = getattr(leg, "legend_handles", None) or getattr(leg, "legendHandles", [])
-        for text, handle in zip(leg.get_texts(), leg_handles):
+        for text, handle in zip(leg.get_texts(), leg.legend_handles):
             if hasattr(handle, "get_color"):
                 text.set_color(handle.get_color())
             elif hasattr(handle, "get_facecolor"):
@@ -640,19 +544,10 @@ def render_plot_with_download(fig, filename_base: str):
 
 
 # =============================================================================
-# 4. HEADER, MODEL ASSUMPTIONS & WORKING POINT METRICS
+# 4. HEADER & WORKING POINT METRICS
 # =============================================================================
 st.title("⚡ Unified PCEC / PCFC Electro-, Mass-, and Heat-Transfer Model")
 st.caption(f"Electrolyte: **{preset_name}** | Solver: **{solver_label}** | Carriers: OH•, V••, O•")
-
-with st.expander("ℹ️ Model Assumptions, Governing Physics & Limitations", expanded=False):
-    st.markdown("""
-    * **Charge Carriers:** Three mobile point defects in Kröger–Vink notation: protons ($\\mathrm{OH_O^\\bullet}, z=+1$), oxygen vacancies ($\\mathrm{V_O^{\\bullet\\bullet}}, z=+2$), and small O-site polarons ($\\mathrm{O_O^\\bullet}, z=+1$), coupled with lattice oxygen conservation ($=3$) and local electroneutrality ($c_p + 2c_v + c_h = c_R$).
-    * **Solvers:**
-      * *Fast (Algebraic):* Assumes constant electric field across the dense electrolyte (Putilov et al., 2020; Restrepo & Banerjee, 2026).
-      * *Exact (1D BVP):* Solves coupled Nernst–Planck ODEs with variable electric field $\\nabla\\Phi(x)$ derived from total current conservation and strict electroneutrality (Newman formulation).
-    * **Limitations:** 1D isothermal membrane-level model; gas-channel convective depletion and concentration overpotentials in thick porous electrodes are neglected; electrode activation losses are modeled via macroscopic $R_p$ using Butler–Volmer $\\operatorname{arcsinh}$ kinetics; LHV efficiency in endothermic PCEC mode accounts for external heat input $Q_{\\mathrm{in}} = \\max(0, -\\dot{q})$.
-    """)
 
 res_pt = solve_single_point(
     i_work, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
@@ -661,10 +556,6 @@ res_pt = solve_single_point(
 
 if solver_mode == "bvp" and not res_pt["bvp_converged"]:
     st.warning("1D BVP solver did not converge at this operating point (falling back to algebraic solution).")
-if res_pt["FE"] > 100.5:
-    st.warning(f"Calculated Faradaic Efficiency ({res_pt['FE']:.1f}%) exceeds 100% — check extreme gas composition or Rp settings.")
-if res_pt["p_O2_f"] < 1e-32:
-    st.warning("Fuel-side equilibrium p(O₂) is below 10⁻³² atm; numerical precision limits may apply at very low T.")
 
 m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("Mode", res_pt["mode"].split()[0])
@@ -695,6 +586,7 @@ with tab1:
     x = res_pt["x_norm"]
 
     with c1:
+        # Defect Concentration Profiles
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(x, res_pt["cp"], lw=lw, marker=mk, ms=ms, label=r"$[\mathrm{OH_O^\bullet}]_L$ (protons)")
         ax.plot(x, res_pt["cv"], lw=lw, marker=mk, ms=ms, label=r"$[\mathrm{V_O^{\bullet\bullet}}]_L$ (vacancies)")
@@ -704,6 +596,7 @@ with tab1:
         style_legend(ax)
         render_plot_with_download(fig, "spatial_defect_profiles")
 
+        # Partial and Total Conductivities
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(x, res_pt["sig_p"] * 1e3, lw=lw, label=r"$\sigma_p$ (protons)")
         ax.plot(x, res_pt["sig_h"] * 1e3, lw=lw, label=r"$\sigma_h$ (polarons)")
@@ -713,6 +606,7 @@ with tab1:
         style_legend(ax)
         render_plot_with_download(fig, "spatial_conductivities")
 
+        # Leakage #1: Polaron Leakage Current Components (Diffusion vs Migration)
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(x, res_pt["i_h_diff_prof"], lw=lw, color="tab:orange", label=r"Diffusion ($i_{h,\mathrm{diff}}$)")
         ax.plot(x, res_pt["i_h_mig_prof"], lw=lw, color="tab:purple", label=r"Migration ($i_{h,\mathrm{mig}}$)")
@@ -723,6 +617,7 @@ with tab1:
         render_plot_with_download(fig, "spatial_leakage_components")
 
     with c2:
+        # Electrostatic Potential and Electric Field
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(x, res_pt["Phi"], lw=lw, color="tab:blue", label=r"Potential ($\Phi$)")
         style_ax(ax, r"Normalized Coordinate ($x / L$)", "Potential (V)", "Electrostatic Potential and Electric Field")
@@ -735,6 +630,7 @@ with tab1:
         style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
         render_plot_with_download(fig, "spatial_potential_field")
 
+        # Internal Gas Partial Pressures
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(x, np.log10(np.maximum(res_pt["p_O2_int"], 1e-35)), lw=lw, label=r"$\log_{10} p_{\mathrm{O_2}}$")
         ax.plot(x, np.log10(np.maximum(res_pt["p_H2O_int"], 1e-35)), lw=lw, label=r"$\log_{10} p_{\mathrm{H_2O}}$")
@@ -754,9 +650,6 @@ with tab2:
     i_max = col_i2.number_input("Max Current Density (PCFC) (A cm⁻²)", 0.1, 3.0, 1.0, 0.1)
     n_pts = col_i3.slider("Sweep Points", 20, 80, 41)
 
-    if not (i_min <= i_work <= i_max):
-        st.info(f"Note: Working current density i = {i_work:.2f} A cm⁻² lies outside the sweep range [{i_min:.2f}, {i_max:.2f}].")
-
     i_grid = np.linspace(i_min, i_max, n_pts)
     sweep_rows = []
     for iv in i_grid:
@@ -773,6 +666,7 @@ with tab2:
 
     c1, c2 = st.columns(2)
     with c1:
+        # Polarization Curve and PCFC Power Density
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(df_i["i"], df_i["V_cell"], lw=lw, marker=mk, ms=ms, color="navy", label=r"$V_{\mathrm{cell}}$")
         ax.axvline(0.0, color="black", ls=":", lw=1.0)
@@ -787,6 +681,7 @@ with tab2:
         style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
         render_plot_with_download(fig, "iv_power_curve")
 
+        # Partial Current Densities
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(df_i["i"], df_i["i_p"], lw=lw, label=r"$i_p$ (protons)")
         ax.plot(df_i["i"], df_i["i_h"], lw=lw, label=r"$i_h$ (polarons / leakage)")
@@ -797,6 +692,7 @@ with tab2:
         style_legend(ax)
         render_plot_with_download(fig, "iv_partial_currents")
 
+        # Faradaic Efficiency and Mean Proton Transport Number
         fig, ax = plt.subplots(figsize=(6, 4.2))
         df_ec = df_i[df_i["i"] < -0.05]
         df_fc_p = df_i[df_i["i"] > 0.05]
@@ -808,6 +704,7 @@ with tab2:
         style_legend(ax)
         render_plot_with_download(fig, "iv_FE_transport")
 
+        # Energy Efficiency (LHV)
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(df_ec["i"], np.clip(df_ec["eff_LHV"], 0, 105), lw=lw, color="teal", label="PCEC Efficiency (LHV)")
         ax.plot(df_fc_p["i"], np.clip(df_fc_p["eff_LHV"], 0, 105), lw=lw, color="purple", label="PCFC Efficiency (LHV)")
@@ -817,6 +714,7 @@ with tab2:
         render_plot_with_download(fig, "iv_energy_efficiency")
 
     with c2:
+        # Voltage Loss Breakdown
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(df_i["i"], df_i["dPhi"], lw=lw, label=r"Membrane ($\Delta\Phi$)")
         ax.plot(df_i["i"], -df_i["eta_H"], lw=lw, label=r"Fuel electrode ($-\eta_{\mathrm{H_2}}$)")
@@ -826,6 +724,7 @@ with tab2:
         style_legend(ax)
         render_plot_with_download(fig, "iv_voltage_losses")
 
+        # Leakage #2: Electronic Leakage Current & Leakage Fraction vs External Current
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(df_i["i"], df_i["i_h"], lw=lw, color="crimson", label=r"Leakage current ($i_h$)")
         ax.axhline(0.0, color="black", ls=":", lw=0.8)
@@ -840,6 +739,7 @@ with tab2:
         style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
         render_plot_with_download(fig, "iv_leakage_analysis")
 
+        # Thermal Balance
         fig, ax = plt.subplots(figsize=(6, 4.2))
         ax.plot(df_i["i"], df_i["q_dot"], lw=lw, color="darkorange", label=r"Heat flux ($\dot{q}$)")
         ax.axhline(0.0, color="black", ls="--", lw=1.0, label=r"Thermoneutral ($\dot{q}=0$)")
@@ -851,244 +751,243 @@ with tab2:
 
     st.download_button("📥 Download I–V Sweep Data (CSV)", df_i.to_csv(index=False).encode("utf-8"), "iv_sweep_data.csv", "text/csv")
 
-
 # -----------------------------------------------------------------------------
-# TAB 3: MULTIPARAMETRIC ANALYSIS (ISOLATED VIA @st.fragment)
+# TAB 3: MULTIPARAMETRIC ANALYSIS
 # -----------------------------------------------------------------------------
-@st.fragment
-def render_multiparametric_tab():
+with tab3:
     st.subheader("Multiparametric Sensitivity Analysis")
 
     PARAM_OPTIONS = {
-        "Temperature (°C)": {"key": "T_C", "min": 450.0, "max": 750.0, "def_min": 500.0, "def_max": 700.0, "fmt": "{:.0f} °C"},
-        "Electrolyte thickness (µm)": {"key": "L_um", "min": 2.0, "max": 200.0, "def_min": 5.0, "def_max": 50.0, "fmt": "{:.1f} µm"},
-        "Acceptor dopant concentration (-)": {"key": "c_R", "min": 0.10, "max": 0.30, "def_min": 0.10, "def_max": 0.30, "fmt": "{:.2f}"},
-        "Fuel electrode p(H₂) (atm)": {"key": "p_H2_f", "min": 0.10, "max": 0.99, "def_min": 0.50, "def_max": 0.98, "fmt": "{:.2f} atm"},
-        "Air electrode p(H₂O) (atm)": {"key": "p_H2O_o", "min": 0.02, "max": 0.95, "def_min": 0.10, "def_max": 0.90, "fmt": "{:.2f} atm"},
-        "Electrode Rp (Ω cm²)": {"key": "Rp", "min": 0.0, "max": 1.0, "def_min": 0.02, "def_max": 0.20, "fmt": "{:.2f} Ω cm²"},
+        "Temperature (°C)": {"key": "T_C", "min": 450.0, "max": 750.0, "def_min": 500.0, "def_max": 700.0, "unit": "°C", "fmt": "{:.0f} °C"},
+        "Electrolyte thickness (µm)": {"key": "L_um", "min": 2.0, "max": 200.0, "def_min": 5.0, "def_max": 50.0, "unit": "µm", "fmt": "{:.1f} µm"},
+        "Acceptor dopant concentration (-)": {"key": "c_R", "min": 0.10, "max": 0.30, "def_min": 0.10, "def_max": 0.30, "unit": "-", "fmt": "{:.2f}"},
+        "Fuel electrode p(H₂) (atm)": {"key": "p_H2_f", "min": 0.10, "max": 0.99, "def_min": 0.50, "def_max": 0.98, "unit": "atm", "fmt": "{:.2f} atm"},
+        "Air electrode p(H₂O) (atm)": {"key": "p_H2O_o", "min": 0.02, "max": 0.95, "def_min": 0.10, "def_max": 0.90, "unit": "atm", "fmt": "{:.2f} atm"},
+        "Electrode Rp (Ω cm²)": {"key": "Rp", "min": 0.0, "max": 1.0, "def_min": 0.02, "def_max": 0.20, "unit": "Ω cm²", "fmt": "{:.2f} Ω cm²"},
     }
 
     p_col1, p_col2, p_col3, p_col4 = st.columns([2, 1, 1, 1])
-    var_label = p_col1.selectbox("Select Parameter to Vary", list(PARAM_OPTIONS.keys()), key="mp_var_select")
+    var_label = p_col1.selectbox("Select Parameter to Vary", list(PARAM_OPTIONS.keys()))
     p_cfg = PARAM_OPTIONS[var_label]
-    v_min = p_col2.number_input("Min", p_cfg["min"], p_cfg["max"], p_cfg["def_min"], key=f"mp_min_{p_cfg['key']}")
-    v_max = p_col3.number_input("Max", p_cfg["min"], p_cfg["max"], p_cfg["def_max"], key=f"mp_max_{p_cfg['key']}")
-    n_vals = p_col4.slider("Number of Steps", 3, 9, 5, key="mp_steps")
+    v_min = p_col2.number_input("Min", p_cfg["min"], p_cfg["max"], p_cfg["def_min"])
+    v_max = p_col3.number_input("Max", p_cfg["min"], p_cfg["max"], p_cfg["def_max"])
+    n_vals = p_col4.slider("Number of Steps", 3, 9, 5)
 
     if v_max <= v_min:
         st.error("Max value must be greater than Min value.")
-        return
+    else:
+        var_values = np.linspace(v_min, v_max, n_vals)
+        cmap = plt.get_cmap(cmap_multi)
+        colors = [cmap(k / max(len(var_values) - 1, 1)) for k in range(len(var_values))]
+        leg_title_use = custom_legend_title.strip() if custom_legend_title.strip() else var_label
 
-    var_values = np.linspace(v_min, v_max, n_vals)
-    cmap = plt.get_cmap(cmap_multi)
-    colors = [cmap(k / max(len(var_values) - 1, 1)) for k in range(len(var_values))]
-    leg_title_use = custom_legend_title.strip() if custom_legend_title.strip() else var_label
+        i_multi = np.linspace(i_min, i_max, 33)
+        multi_iv = {}
+        summary_rows = []
 
-    i_multi = np.linspace(i_min, i_max, 33)
-    multi_iv = {}
-    summary_rows = []
+        for val in var_values:
+            # Override only the selected parameter
+            T_v = float(val) if p_cfg["key"] == "T_C" else T_work
+            L_v = float(val) if p_cfg["key"] == "L_um" else L_work
+            cR_v = float(val) if p_cfg["key"] == "c_R" else c_R_work
+            pH2_v = float(val) if p_cfg["key"] == "p_H2_f" else p_H2_f
+            pH2Of_v = max(1.0 - pH2_v, 1e-4) if (p_cfg["key"] == "p_H2_f" and binary_fuel) else p_H2O_f
+            pH2Oo_v = float(val) if p_cfg["key"] == "p_H2O_o" else p_H2O_o
+            RpH_v = float(val) if p_cfg["key"] == "Rp" else Rp_H
+            RpO_v = float(val) if p_cfg["key"] == "Rp" else Rp_O
 
-    for val in var_values:
-        T_v = float(val) if p_cfg["key"] == "T_C" else T_work
-        L_v = float(val) if p_cfg["key"] == "L_um" else L_work
-        cR_v = float(val) if p_cfg["key"] == "c_R" else c_R_work
-        pH2_v = float(val) if p_cfg["key"] == "p_H2_f" else p_H2_f
-        pH2Of_v = max(1.0 - pH2_v, 1e-4) if (p_cfg["key"] == "p_H2_f" and binary_fuel) else p_H2O_f
-        pH2Oo_v = float(val) if p_cfg["key"] == "p_H2O_o" else p_H2O_o
-        RpH_v = float(val) if p_cfg["key"] == "Rp" else Rp_H
-        RpO_v = float(val) if p_cfg["key"] == "Rp" else Rp_O
+            rows_v = []
+            for iv in i_multi:
+                r = solve_single_point(
+                    float(iv), T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v,
+                    mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=25
+                )
+                rows_v.append(r)
+            multi_iv[val] = pd.DataFrame(rows_v)
 
-        rows_v = []
-        for iv in i_multi:
-            r = solve_single_point(
-                float(iv), T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v,
-                mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=25
+            r_ocv = solve_single_point(0.0, T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, "fast", use_arcsinh_shift, 25)
+            r_wk = solve_single_point(i_work, T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, "fast", use_arcsinh_shift, 25)
+            P_max, i_Pmax, i_TN, V_TN_pt, i_trans = find_special_points(
+                T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, use_arcsinh_shift
             )
-            rows_v.append(r)
-        multi_iv[val] = pd.DataFrame(rows_v)
 
-        r_ocv = solve_single_point(0.0, T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, "fast", use_arcsinh_shift, 25)
-        r_wk = solve_single_point(i_work, T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, "fast", use_arcsinh_shift, 25)
-        P_max, i_Pmax, i_TN, V_TN_pt, i_trans = find_special_points(
-            T_v, L_v, RpH_v, RpO_v, pH2_v, pH2Of_v, pH2Oo_v, cR_v, mat_params, use_arcsinh_shift
-        )
+            summary_rows.append({
+                "param": val,
+                "P_max": P_max, "i_Pmax": i_Pmax,
+                "i_TN": i_TN, "V_TN_pt": V_TN_pt,
+                "J_H2": abs(r_wk["J_H2"]), "J_H2_Nml_min": abs(r_wk["J_H2_Nml_min"]),
+                "FE_wk": r_wk["FE"], "eff_wk": r_wk["eff_LHV"],
+                "E_eq": r_ocv["E_eq"], "OCV": r_ocv["V_cell"],
+                "RdOCV_mV": (r_ocv["E_eq"] - r_ocv["V_cell"]) * 1e3,
+                "i_leak_OCV": abs(r_ocv["i_h"]), "i_trans": i_trans,
+                "ASR_ohm": r_wk["ASR_ohm"], "t_p_wk": r_wk["t_p"] * 100.0,
+                "q_dot_wk": r_wk["q_dot"], "V_cell_wk": r_wk["V_cell"],
+            })
 
-        summary_rows.append({
-            "param": val,
-            "P_max": P_max, "i_Pmax": i_Pmax,
-            "i_TN": i_TN, "V_TN_pt": V_TN_pt,
-            "J_H2": abs(r_wk["J_H2"]), "J_H2_Nml_min": abs(r_wk["J_H2_Nml_min"]),
-            "FE_wk": r_wk["FE"], "eff_wk": r_wk["eff_LHV"],
-            "E_eq": r_ocv["E_eq"], "OCV": r_ocv["V_cell"],
-            "RdOCV_mV": (r_ocv["E_eq"] - r_ocv["V_cell"]) * 1e3,
-            "i_leak_OCV": abs(r_ocv["i_h"]), "i_trans": i_trans,
-            "ASR_ohm": r_wk["ASR_ohm"], "t_p_wk": r_wk["t_p"] * 100.0,
-            "q_dot_wk": r_wk["q_dot"], "V_cell_wk": r_wk["V_cell"],
-        })
+        df_sum = pd.DataFrame(summary_rows)
 
-    df_sum = pd.DataFrame(summary_rows)
+        st.markdown("### Families of Curves vs. Current Density")
+        c1, c2 = st.columns(2)
+        with c1:
+            # Family of Polarization Curves
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            for idx, val in enumerate(var_values):
+                df_v = multi_iv[val]
+                ax.plot(df_v["i"], df_v["V_cell"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
+            ax.axvline(0, color="black", ls=":", lw=0.8)
+            style_ax(ax, r"Current Density (A cm$^{-2}$)", "Cell Voltage (V)", f"Polarization Curves vs. {var_label}")
+            style_legend(ax, title=leg_title_use)
+            render_plot_with_download(fig, "mp_family_IV")
 
-    st.markdown("### Families of Curves vs. Current Density")
-    c1, c2 = st.columns(2)
-    with c1:
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        for idx, val in enumerate(var_values):
-            df_v = multi_iv[val]
-            ax.plot(df_v["i"], df_v["V_cell"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
-        ax.axvline(0, color="black", ls=":", lw=0.8)
-        style_ax(ax, r"Current Density (A cm$^{-2}$)", "Cell Voltage (V)", f"Polarization Curves vs. {var_label}")
-        style_legend(ax, title=leg_title_use)
-        render_plot_with_download(fig, "mp_family_IV")
+            # Family of Electronic Leakage Current
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            for idx, val in enumerate(var_values):
+                df_v = multi_iv[val]
+                ax.plot(df_v["i"], df_v["i_h"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
+            ax.axhline(0, color="black", ls=":", lw=0.8)
+            ax.axvline(0, color="black", ls=":", lw=0.8)
+            style_ax(ax, r"External Current Density (A cm$^{-2}$)", r"Leakage Current Density (A cm$^{-2}$)", f"Electronic Leakage vs. {var_label}")
+            style_legend(ax, title=leg_title_use)
+            render_plot_with_download(fig, "mp_family_leakage")
 
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        for idx, val in enumerate(var_values):
-            df_v = multi_iv[val]
-            ax.plot(df_v["i"], df_v["i_h"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
-        ax.axhline(0, color="black", ls=":", lw=0.8)
-        ax.axvline(0, color="black", ls=":", lw=0.8)
-        style_ax(ax, r"External Current Density (A cm$^{-2}$)", r"Leakage Current Density (A cm$^{-2}$)", f"Electronic Leakage vs. {var_label}")
-        style_legend(ax, title=leg_title_use)
-        render_plot_with_download(fig, "mp_family_leakage")
+        with c2:
+            # Family of Faradaic Efficiency
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            for idx, val in enumerate(var_values):
+                df_v = multi_iv[val]
+                df_ec_v = df_v[df_v["i"] < -0.05]
+                df_fc_v = df_v[df_v["i"] > 0.05]
+                ax.plot(df_ec_v["i"], np.clip(df_ec_v["FE"], 0, 105), lw=lw, color=colors[idx], label=p_cfg["fmt"].format(val))
+                ax.plot(df_fc_v["i"], np.clip(df_fc_v["FE"], 0, 105), lw=lw, ls="--", color=colors[idx])
+            ax.set_ylim(0, 105)
+            style_ax(ax, r"Current Density (A cm$^{-2}$)", "Faradaic Efficiency (%)", f"Faradaic Efficiency vs. {var_label}")
+            style_legend(ax, title=leg_title_use)
+            render_plot_with_download(fig, "mp_family_FE")
 
-    with c2:
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        for idx, val in enumerate(var_values):
-            df_v = multi_iv[val]
-            df_ec_v = df_v[df_v["i"] < -0.05]
-            df_fc_v = df_v[df_v["i"] > 0.05]
-            ax.plot(df_ec_v["i"], np.clip(df_ec_v["FE"], 0, 105), lw=lw, color=colors[idx], label=p_cfg["fmt"].format(val))
-            ax.plot(df_fc_v["i"], np.clip(df_fc_v["FE"], 0, 105), lw=lw, ls="--", color=colors[idx])
-        ax.set_ylim(0, 105)
-        style_ax(ax, r"Current Density (A cm$^{-2}$)", "Faradaic Efficiency (%)", f"Faradaic Efficiency vs. {var_label}")
-        style_legend(ax, title=leg_title_use)
-        render_plot_with_download(fig, "mp_family_FE")
+            # Family of PCFC Power Density
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            for idx, val in enumerate(var_values):
+                df_v = multi_iv[val]
+                df_fc_v = df_v[df_v["i"] >= 0]
+                ax.plot(df_fc_v["i"], df_fc_v["P_elec"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
+            style_ax(ax, r"Current Density (A cm$^{-2}$)", r"Power Density (W cm$^{-2}$)", f"PCFC Power Density vs. {var_label}")
+            style_legend(ax, title=leg_title_use)
+            render_plot_with_download(fig, "mp_family_power")
 
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        for idx, val in enumerate(var_values):
-            df_v = multi_iv[val]
-            df_fc_v = df_v[df_v["i"] >= 0]
-            ax.plot(df_fc_v["i"], df_fc_v["P_elec"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=p_cfg["fmt"].format(val))
-        style_ax(ax, r"Current Density (A cm$^{-2}$)", r"Power Density (W cm$^{-2}$)", f"PCFC Power Density vs. {var_label}")
-        style_legend(ax, title=leg_title_use)
-        render_plot_with_download(fig, "mp_family_power")
-
-    st.markdown(f"### Key Performance Metrics vs. {var_label}")
-    c1, c2 = st.columns(2)
-    with c1:
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(df_sum["param"], df_sum["P_max"], lw=lw, marker="o", ms=ms, color="crimson", label=r"$P_{\max}$")
-        style_ax(ax, var_label, r"Max Power Density (W cm$^{-2}$)", "Maximum PCFC Power Density")
-        ax2 = ax.twinx()
-        ax2.plot(df_sum["param"], df_sum["i_Pmax"], lw=lw, ls="--", marker="s", ms=ms, color="navy", label=r"$i(P_{\max})$")
-        ax2.set_ylabel(r"Current Density at $P_{\max}$ (A cm$^{-2}$)", color="navy")
-        ax2.tick_params(axis="y", labelcolor="navy", direction="in")
-        l1, lb1 = ax.get_legend_handles_labels()
-        l2, lb2 = ax2.get_legend_handles_labels()
-        style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
-        render_plot_with_download(fig, "mp_Pmax")
-
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(df_sum["param"], df_sum["J_H2_Nml_min"], lw=lw, marker="o", ms=ms, color="tab:blue", label=r"$J_{\mathrm{H_2}}$ (volumetric)")
-        style_ax(ax, var_label, r"$\mathrm{H_2}$ Flux (Nml cm$^{-2}$ min$^{-1}$)", f"Hydrogen Flux at i = {i_work:.2f} A cm⁻²")
-        ax2 = ax.twinx()
-        ax2.plot(df_sum["param"], df_sum["J_H2"] * 1e6, lw=lw, ls="--", marker="^", ms=ms, color="teal", label=r"$J_{\mathrm{H_2}}$ (molar)")
-        ax2.set_ylabel(r"Molar $\mathrm{H_2}$ Flux ($\mu$mol cm$^{-2}$ s$^{-1}$)", color="teal")
-        ax2.tick_params(axis="y", labelcolor="teal", direction="in")
-        l1, lb1 = ax.get_legend_handles_labels()
-        l2, lb2 = ax2.get_legend_handles_labels()
-        style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
-        render_plot_with_download(fig, "mp_H2_flux")
-
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(df_sum["param"], df_sum["E_eq"], lw=lw, marker="o", ms=ms, color="navy", label=r"$E_{\mathrm{eq}}$")
-        ax.plot(df_sum["param"], df_sum["OCV"], lw=lw, marker="s", ms=ms, color="tab:green", label="OCV")
-        style_ax(ax, var_label, "Potential (V)", "Equilibrium Potential, OCV, and OCV Loss")
-        ax2 = ax.twinx()
-        ax2.plot(df_sum["param"], df_sum["RdOCV_mV"], lw=lw, ls="--", marker="^", ms=ms, color="crimson", label="RdOCV")
-        ax2.set_ylabel("OCV Reduction, RdOCV (mV)", color="crimson")
-        ax2.tick_params(axis="y", labelcolor="crimson", direction="in")
-        l1, lb1 = ax.get_legend_handles_labels()
-        l2, lb2 = ax2.get_legend_handles_labels()
-        style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
-        render_plot_with_download(fig, "mp_OCV_RdOCV")
-
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(df_sum["param"], df_sum["ASR_ohm"], lw=lw, marker="o", ms=ms, color="darkviolet", label=r"$\mathrm{ASR}_{\mathrm{ohm}}$")
-        style_ax(ax, var_label, r"Membrane Ohmic ASR ($\Omega$ cm$^2$)", "Ohmic Resistance and Proton Transport Number")
-        ax2 = ax.twinx()
-        ax2.plot(df_sum["param"], df_sum["t_p_wk"], lw=lw, ls="--", marker="s", ms=ms, color="tab:blue", label=r"Mean $t_p$")
-        ax2.set_ylabel("Mean Proton Transport Number (%)", color="tab:blue")
-        ax2.tick_params(axis="y", labelcolor="tab:blue", direction="in")
-        l1, lb1 = ax.get_legend_handles_labels()
-        l2, lb2 = ax2.get_legend_handles_labels()
-        style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
-        render_plot_with_download(fig, "mp_ASR_tp")
-
-    with c2:
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        if df_sum["i_TN"].notna().any():
-            ax.plot(df_sum["param"], df_sum["i_TN"], lw=lw, marker="o", ms=ms, color="darkorange", label=r"$i_{\mathrm{TN}}$ (PCEC)")
-        else:
-            ax.set_xlim(v_min, v_max)
-        style_ax(ax, var_label, r"Thermoneutral Current Density (A cm$^{-2}$)", "Thermoneutral Operating Point (PCEC)")
-        ax2 = ax.twinx()
-        if df_sum["V_TN_pt"].notna().any():
-            ax2.plot(df_sum["param"], df_sum["V_TN_pt"], lw=lw, ls="--", marker="s", ms=ms, color="black", label=r"$V_{\mathrm{TN}}^{\mathrm{act}}$")
-        ax2.set_ylabel("Actual Thermoneutral Voltage (V)", color="black")
-        ax2.tick_params(axis="y", labelcolor="black", direction="in")
-        l1, lb1 = ax.get_legend_handles_labels()
-        l2, lb2 = ax2.get_legend_handles_labels()
-        if l1 or l2:
+        st.markdown(f"### Key Performance Metrics vs. {var_label}")
+        c1, c2 = st.columns(2)
+        with c1:
+            # 1. P_max and i(P_max)
+            fig, ax = plt.subplots(figsize=(6, 4.0))
+            ax.plot(df_sum["param"], df_sum["P_max"], lw=lw, marker="o", ms=ms, color="crimson", label=r"$P_{\max}$")
+            style_ax(ax, var_label, r"Max Power Density (W cm$^{-2}$)", "Maximum PCFC Power Density")
+            ax2 = ax.twinx()
+            ax2.plot(df_sum["param"], df_sum["i_Pmax"], lw=lw, ls="--", marker="s", ms=ms, color="navy", label=r"$i(P_{\max})$")
+            ax2.set_ylabel(r"Current Density at $P_{\max}$ (A cm$^{-2}$)", color="navy")
+            ax2.tick_params(axis="y", labelcolor="navy", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
             style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
-        render_plot_with_download(fig, "mp_thermoneutral")
+            render_plot_with_download(fig, "mp_Pmax")
 
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(df_sum["param"], df_sum["FE_wk"], lw=lw, marker="o", ms=ms, color="tab:blue", label="Faradaic Efficiency (FE)")
-        ax.plot(df_sum["param"], df_sum["eff_wk"], lw=lw, marker="s", ms=ms, color="tab:green", label="LHV Energy Efficiency")
-        ax.set_ylim(0, 105)
-        style_ax(ax, var_label, "Efficiency (%)", f"Faradaic and Energy Efficiency (i = {i_work:.2f} A cm⁻²)")
-        style_legend(ax)
-        render_plot_with_download(fig, "mp_FE_eff")
+            # 3. Hydrogen Production / Consumption Flux
+            fig, ax = plt.subplots(figsize=(6, 4.0))
+            ax.plot(df_sum["param"], df_sum["J_H2_Nml_min"], lw=lw, marker="o", ms=ms, color="tab:blue", label=r"$J_{\mathrm{H_2}}$ (volumetric)")
+            style_ax(ax, var_label, r"$\mathrm{H_2}$ Flux (Nml cm$^{-2}$ min$^{-1}$)", f"Hydrogen Flux at i = {i_work:.2f} A cm⁻²")
+            ax2 = ax.twinx()
+            ax2.plot(df_sum["param"], df_sum["J_H2"] * 1e6, lw=lw, ls="--", marker="^", ms=ms, color="teal", label=r"$J_{\mathrm{H_2}}$ (molar)")
+            ax2.set_ylabel(r"Molar $\mathrm{H_2}$ Flux ($\mu$mol cm$^{-2}$ s$^{-1}$)", color="teal")
+            ax2.tick_params(axis="y", labelcolor="teal", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
+            render_plot_with_download(fig, "mp_H2_flux")
 
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(df_sum["param"], df_sum["i_leak_OCV"] * 1e3, lw=lw, marker="o", ms=ms, color="crimson", label=r"$|i_{\mathrm{leak, OCV}}|$")
-        style_ax(ax, var_label, r"OCV Leakage Current (mA cm$^{-2}$)", "OCV Electronic Leakage and Transition Current")
-        ax2 = ax.twinx()
-        ax2.plot(df_sum["param"], df_sum["i_trans"] * 1e3, lw=lw, ls="--", marker="^", ms=ms, color="navy", label=r"$i_{\mathrm{PCFC}\to\mathrm{PCEC}}$")
-        ax2.set_ylabel(r"Transition Current Density (mA cm$^{-2}$)", color="navy")
-        ax2.tick_params(axis="y", labelcolor="navy", direction="in")
-        l1, lb1 = ax.get_legend_handles_labels()
-        l2, lb2 = ax2.get_legend_handles_labels()
-        style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
-        render_plot_with_download(fig, "mp_leakage_OCV_trans")
+            # 5. E_eq, OCV, and RdOCV
+            fig, ax = plt.subplots(figsize=(6, 4.0))
+            ax.plot(df_sum["param"], df_sum["E_eq"], lw=lw, marker="o", ms=ms, color="navy", label=r"$E_{\mathrm{eq}}$")
+            ax.plot(df_sum["param"], df_sum["OCV"], lw=lw, marker="s", ms=ms, color="tab:green", label="OCV")
+            style_ax(ax, var_label, "Potential (V)", "Equilibrium Potential, OCV, and OCV Loss")
+            ax2 = ax.twinx()
+            ax2.plot(df_sum["param"], df_sum["RdOCV_mV"], lw=lw, ls="--", marker="^", ms=ms, color="crimson", label="RdOCV")
+            ax2.set_ylabel("OCV Reduction, RdOCV (mV)", color="crimson")
+            ax2.tick_params(axis="y", labelcolor="crimson", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
+            render_plot_with_download(fig, "mp_OCV_RdOCV")
 
-        fig, ax = plt.subplots(figsize=(6, 4.0))
-        ax.plot(df_sum["param"], df_sum["q_dot_wk"], lw=lw, marker="o", ms=ms, color="darkorange", label=r"Heat flux ($\dot{q}$)")
-        ax.axhline(0.0, color="gray", ls=":", lw=0.8)
-        style_ax(ax, var_label, r"Heat Flux (W cm$^{-2}$)", f"Heat Flux and Cell Voltage (i = {i_work:.2f} A cm⁻²)")
-        ax2 = ax.twinx()
-        ax2.plot(df_sum["param"], df_sum["V_cell_wk"], lw=lw, ls="--", marker="s", ms=ms, color="navy", label=r"$V_{\mathrm{cell}}$")
-        ax2.set_ylabel("Cell Voltage (V)", color="navy")
-        ax2.tick_params(axis="y", labelcolor="navy", direction="in")
-        l1, lb1 = ax.get_legend_handles_labels()
-        l2, lb2 = ax2.get_legend_handles_labels()
-        style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
-        render_plot_with_download(fig, "mp_heat_voltage")
+            # 7. Membrane Ohmic ASR and Mean Proton Transport Number
+            fig, ax = plt.subplots(figsize=(6, 4.0))
+            ax.plot(df_sum["param"], df_sum["ASR_ohm"], lw=lw, marker="o", ms=ms, color="darkviolet", label=r"$\mathrm{ASR}_{\mathrm{ohm}}$")
+            style_ax(ax, var_label, r"Membrane Ohmic ASR ($\Omega$ cm$^2$)", "Ohmic Resistance and Proton Transport Number")
+            ax2 = ax.twinx()
+            ax2.plot(df_sum["param"], df_sum["t_p_wk"], lw=lw, ls="--", marker="s", ms=ms, color="tab:blue", label=r"Mean $t_p$")
+            ax2.set_ylabel("Mean Proton Transport Number (%)", color="tab:blue")
+            ax2.tick_params(axis="y", labelcolor="tab:blue", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
+            render_plot_with_download(fig, "mp_ASR_tp")
 
-    st.download_button("📥 Download Multiparametric Summary (CSV)", df_sum.to_csv(index=False).encode("utf-8"), "multiparametric_summary.csv", "text/csv")
+        with c2:
+            # 2. Thermoneutral Current Density and Actual TN Voltage
+            fig, ax = plt.subplots(figsize=(6, 4.0))
+            ax.plot(df_sum["param"], df_sum["i_TN"], lw=lw, marker="o", ms=ms, color="darkorange", label=r"$i_{\mathrm{TN}}$ (PCEC)")
+            style_ax(ax, var_label, r"Thermoneutral Current Density (A cm$^{-2}$)", "Thermoneutral Operating Point (PCEC)")
+            ax2 = ax.twinx()
+            ax2.plot(df_sum["param"], df_sum["V_TN_pt"], lw=lw, ls="--", marker="s", ms=ms, color="black", label=r"$V_{\mathrm{TN}}^{\mathrm{act}}$")
+            ax2.set_ylabel("Actual Thermoneutral Voltage (V)", color="black")
+            ax2.tick_params(axis="y", labelcolor="black", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
+            render_plot_with_download(fig, "mp_thermoneutral")
 
+            # 4. Faradaic Efficiency & LHV Energy Efficiency
+            fig, ax = plt.subplots(figsize=(6, 4.0))
+            ax.plot(df_sum["param"], df_sum["FE_wk"], lw=lw, marker="o", ms=ms, color="tab:blue", label="Faradaic Efficiency (FE)")
+            ax.plot(df_sum["param"], df_sum["eff_wk"], lw=lw, marker="s", ms=ms, color="tab:green", label="LHV Energy Efficiency")
+            ax.set_ylim(0, 105)
+            style_ax(ax, var_label, "Efficiency (%)", f"Faradaic and Energy Efficiency (i = {i_work:.2f} A cm⁻²)")
+            style_legend(ax)
+            render_plot_with_download(fig, "mp_FE_eff")
 
-with tab3:
-    render_multiparametric_tab()
+            # 6. Leakage #3: OCV Leakage Current & Transition Current Density
+            fig, ax = plt.subplots(figsize=(6, 4.0))
+            ax.plot(df_sum["param"], df_sum["i_leak_OCV"] * 1e3, lw=lw, marker="o", ms=ms, color="crimson", label=r"$|i_{\mathrm{leak, OCV}}|$")
+            style_ax(ax, var_label, r"OCV Leakage Current (mA cm$^{-2}$)", "OCV Electronic Leakage and Transition Current")
+            ax2 = ax.twinx()
+            ax2.plot(df_sum["param"], df_sum["i_trans"] * 1e3, lw=lw, ls="--", marker="^", ms=ms, color="navy", label=r"$i_{\mathrm{PCFC}\to\mathrm{PCEC}}$")
+            ax2.set_ylabel(r"Transition Current Density (mA cm$^{-2}$)", color="navy")
+            ax2.tick_params(axis="y", labelcolor="navy", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
+            render_plot_with_download(fig, "mp_leakage_OCV_trans")
 
+            # 8. Heat Flux and Cell Voltage at Working Point
+            fig, ax = plt.subplots(figsize=(6, 4.0))
+            ax.plot(df_sum["param"], df_sum["q_dot_wk"], lw=lw, marker="o", ms=ms, color="darkorange", label=r"Heat flux ($\dot{q}$)")
+            ax.axhline(0.0, color="gray", ls=":", lw=0.8)
+            style_ax(ax, var_label, r"Heat Flux (W cm$^{-2}$)", f"Heat Flux and Cell Voltage (i = {i_work:.2f} A cm⁻²)")
+            ax2 = ax.twinx()
+            ax2.plot(df_sum["param"], df_sum["V_cell_wk"], lw=lw, ls="--", marker="s", ms=ms, color="navy", label=r"$V_{\mathrm{cell}}$")
+            ax2.set_ylabel("Cell Voltage (V)", color="navy")
+            ax2.tick_params(axis="y", labelcolor="navy", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            style_legend(ax, handles=l1 + l2, labels=lb1 + lb2)
+            render_plot_with_download(fig, "mp_heat_voltage")
+
+        st.download_button("📥 Download Multiparametric Summary (CSV)", df_sum.to_csv(index=False).encode("utf-8"), "multiparametric_summary.csv", "text/csv")
 
 # -----------------------------------------------------------------------------
-# TAB 4: 2D HEATMAPS (ISOLATED VIA @st.fragment)
+# TAB 4: 2D HEATMAPS (CONTOUR MAPS)
 # -----------------------------------------------------------------------------
-@st.fragment
-def render_heatmaps_tab():
+with tab4:
     st.subheader("2D Parametric Heatmaps")
-    res_hm = st.slider("Heatmap Grid Resolution (N × N)", 12, 35, 20, key="hm_res")
+    res_hm = st.slider("Heatmap Grid Resolution (N × N)", 12, 35, 20)
 
     T_hm = np.linspace(480, 700, res_hm)
     i_hm_ec = np.linspace(-1.8, -0.1, res_hm)
@@ -1117,6 +1016,7 @@ def render_heatmaps_tab():
 
     c1, c2 = st.columns(2)
     with c1:
+        # Heatmap 1: FE(T, i)
         fig, ax = plt.subplots(figsize=(6, 4.4))
         cf = ax.contourf(i_hm_ec, T_hm, FE_map, levels=20, cmap=cmap_heat)
         if show_contours:
@@ -1126,6 +1026,7 @@ def render_heatmaps_tab():
         style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", "Temperature (°C)", "Faradaic Efficiency Map")
         render_plot_with_download(fig, "heatmap_FE_Ti")
 
+        # Heatmap 3: Energy Efficiency(L, i)
         fig, ax = plt.subplots(figsize=(6, 4.4))
         cf = ax.contourf(i_hm_ec, L_hm, Eff_L_map, levels=20, cmap=cmap_heat)
         if show_contours:
@@ -1136,6 +1037,7 @@ def render_heatmaps_tab():
         render_plot_with_download(fig, "heatmap_Eff_Li")
 
     with c2:
+        # Heatmap 2: Thermal Balance q_dot(T, i)
         fig, ax = plt.subplots(figsize=(6, 4.4))
         vmax = max(abs(Q_map.min()), abs(Q_map.max()), 0.1)
         cf = ax.contourf(i_hm_ec, T_hm, Q_map, levels=20, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
@@ -1146,6 +1048,7 @@ def render_heatmaps_tab():
         style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", "Temperature (°C)", "Thermal Balance and Thermoneutral Boundary")
         render_plot_with_download(fig, "heatmap_Q_Ti")
 
+        # Heatmap 4: Internal Oxygen Partial Pressure
         fig, ax = plt.subplots(figsize=(6, 4.4))
         cf = ax.contourf(i_hm_ec, x_hm, pO2_map, levels=20, cmap=cmap_heat)
         if show_contours:
@@ -1154,7 +1057,3 @@ def render_heatmaps_tab():
         fig.colorbar(cf, ax=ax, label=r"$\log_{10}(p_{\mathrm{O_2}}\ /\ \mathrm{atm})$")
         style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", r"Normalized Coordinate ($x / L$)", f"Internal Oxygen Pressure Map ({T_work} °C)")
         render_plot_with_download(fig, "heatmap_pO2_xi")
-
-
-with tab4:
-    render_heatmaps_tab()
