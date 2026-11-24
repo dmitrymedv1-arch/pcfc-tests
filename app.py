@@ -1,809 +1,840 @@
-import os
 import io
-import time
 import numpy as np
 import pandas as pd
-import scipy.io as sio
-from scipy.optimize import brentq
-from scipy.sparse import csc_matrix
-from scipy.sparse.linalg import spsolve
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from scipy.optimize import brentq
+from scipy.integrate import solve_bvp
 import streamlit as st
 
-# ==============================================================================
-# КОНФИГУРАЦИЯ СТРАНИЦЫ STREAMLIT
-# ==============================================================================
+# =============================================================================
+# 1. КОНФИГУРАЦИЯ СТРАНИЦЫ И ФИЗИЧЕСКИЕ КОНСТАНТЫ
+# =============================================================================
 st.set_page_config(
-    page_title="PCEC Electrochemistry Simulator (BZCYYb4411)",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="PCEC / PCFC Multiphysics Membrane Model",
+    page_icon="⚡",
+    layout="wide"
 )
 
-# Глобальные физические константы
-R_GAS = 8.314        # Дж / (моль * К)
-F_CONST = 96485.0    # Кл / моль
-VM_4411 = 5.1323e-5  # Молярный объем BZCYYb4411, м^3 / моль
+R_GAS = 8.314462618      # Дж / (моль * К)
+F_CONST = 96485.33212    # Кл / моль
+DH_W = -248110.0         # Дж / моль (H2 + 0.5 O2 <-> H2O, 500-700 C)
+DS_W = -55.48            # Дж / (моль * К)
+LHV_H2 = 241800.0        # Дж / моль (при 25 C)
+
+# Пресеты материалов из статей (Thatte 2024, Restrepo 2026, Moranti 2026)
+MATERIAL_PRESETS = {
+    "BCZYYb7111 (Thatte 2024 / Restrepo 2026)": {
+        "Vm": 5.13e-5,
+        "dH_H2O": -93300.0,  "dS_H2O": -100.0,
+        "dH_O2":  114880.0,  "dS_O2":  -45.89,
+        "D0_p": 1.02e-7,     "E_p": 42650.0,
+        "D0_v": 1.73e-7,     "E_v": 59700.0,
+        "D0_h": 2.41e-5,     "E_h": 8400.0,
+        "default_cR": 0.20,
+    },
+    "BZY20 (Moranti 2026)": {
+        "Vm": 4.57e-5,
+        "dH_H2O": -93300.0,  "dS_H2O": -100.0,
+        "dH_O2":  115310.0,  "dS_O2":  -45.89,
+        "D0_p": 5.18e-7,     "E_p": 60660.0,
+        "D0_v": 2.03e-7,     "E_v": 85190.0,
+        "D0_h": 1.38e-5,     "E_h": 7180.0,
+        "default_cR": 0.20,
+    },
+    "BCZY652015 (Moranti 2026)": {
+        "Vm": 4.57e-5,
+        "dH_H2O": -123000.0, "dS_H2O": -130.95,
+        "dH_O2":  132570.0,  "dS_O2":  -119.93,
+        "D0_p": 1.63e-7,     "E_p": 47190.0,
+        "D0_v": 1.36e-7,     "E_v": 68060.0,
+        "D0_h": 2.50e-3,     "E_h": 9730.0,
+        "default_cR": 0.15,
+    },
+}
 
 
-# ==============================================================================
-# 1. ГРАНИЧНЫЕ УСЛОВИЯ НА ЭЛЕКТРОДАХ (Водородный и Кислородный)
-# ==============================================================================
+# =============================================================================
+# 2. ФИЗИКО-МАТЕМАТИЧЕСКОЕ ЯДРО (3 НОСИТЕЛЯ: p=OH_O*, v=V_O**, h=O_O*)
+# =============================================================================
+def get_material_props(T_K: float, mat: dict):
+    """Возвращает константы равновесия и коэффициенты диффузии при T_K."""
+    K_W = np.exp(DS_W / R_GAS - DH_W / (R_GAS * T_K))
+    K_H2O = np.exp(mat["dS_H2O"] / R_GAS - mat["dH_H2O"] / (R_GAS * T_K))
+    K_O2 = np.exp(mat["dS_O2"] / R_GAS - mat["dH_O2"] / (R_GAS * T_K))
+    D_p = mat["D0_p"] * np.exp(-mat["E_p"] / (R_GAS * T_K))
+    D_v = mat["D0_v"] * np.exp(-mat["E_v"] / (R_GAS * T_K))
+    D_h = mat["D0_h"] * np.exp(-mat["E_h"] / (R_GAS * T_K))
+    return K_W, K_H2O, K_O2, D_p, D_v, D_h
 
-def _charge_balance_residual(Cv, electrode, Ph2, Ph2o, Po2, Cd, params):
-    """Невязка уравнения электронейтральности в равновесии (OCV) на границе."""
-    Kph2o = params['Kph2o']
-    Kpo2 = params['Kpo2']
-    Kph2 = params['Kph2']
-    Kpeh = params['Kpeh']
 
-    a = 1.0 / (Kph2o * Ph2o * Cv)
-    b = 1.0
-    c = Cv - 3.0
-    disc = max(b**2 - 4.0 * a * c, 0.0)
-    Coh = (-b + np.sqrt(disc)) / (2.0 * a)
-    Co = (Coh**2) / (Kph2o * Ph2o * Cv)
+def solve_boundary_defects(p_H2O: float, p_O2: float, c_R: float, K_H2O: float, K_O2: float):
+    """
+    Точное решение дефектного равновесия на границе (3 подвижных дефекта + O_O^x = 3).
+    Возвращает безразмерные концентрации [OH_O*]_L, [V_O**]_L, [O_O*]_L, [O_O^x]_L.
+    """
+    p_H2O = max(p_H2O, 1e-18)
+    p_O2 = max(p_O2, 1e-35)
 
-    if electrode == 'oxygen':
-        Ch = np.sqrt(Cv * Kpo2 * np.sqrt(Po2) / Co)
-        Ce = Kpeh / Ch
-    elif electrode == 'hydrogen':
-        Ce = Kph2 * np.sqrt(Ph2) * Co / Coh
-        Ch = Kpeh / Ce
+    alpha = np.sqrt((K_O2 * np.sqrt(p_O2)) / (K_H2O * p_H2O))
+    denom = 1.0 + alpha
+
+    def residual(v):
+        p = (c_R - 2.0 * v) / denom
+        o = 3.0 - c_R + v
+        return p * p - K_H2O * p_H2O * v * o
+
+    v_max = 0.5 * c_R
+    # Гарантированный единственный корень в (0, c_R/2)
+    v_sol = brentq(residual, 1e-18 * v_max, v_max * (1.0 - 1e-15), xtol=1e-14, rtol=1e-13)
+    p_sol = (c_R - 2.0 * v_sol) / denom
+    h_sol = alpha * p_sol
+    o_sol = 3.0 - c_R + v_sol
+    return p_sol, v_sol, h_sol, o_sol
+
+
+def bernoulli_flux(u: float, c_f: float, c_o: float) -> float:
+    """
+    Численно устойчивое вычисление u * (c_o - c_f * exp(-u)) / (1 - exp(-u))
+    без переполнения экспоненты для любого знака и величины u.
+    """
+    if abs(u) < 1e-6:
+        # Разложение Тейлора вокруг u = 0
+        return (c_o - c_f) + 0.5 * u * (c_o + c_f) + (u * u / 12.0) * (c_o - c_f)
+    elif u > 0:
+        eu = np.exp(-u)
+        return u * (c_o - c_f * eu) / (1.0 - eu)
     else:
-        raise ValueError("electrode must be 'oxygen' or 'hydrogen'")
-
-    return 2.0 * Cv + Coh + Ch - Ce - Cd
-
-
-def _find_bracket_and_solve(func, a_min=1e-12, a_max=1.5, n_scan=2000):
-    """Надежный поиск корня на интервале (замена initial_guess_* + fzero)."""
-    grid = np.linspace(a_min, a_max, n_scan)
-    vals = np.array([func(x) for x in grid])
-    sign_changes = np.where(vals[:-1] * vals[1:] <= 0)[0]
-    if len(sign_changes) == 0:
-        raise RuntimeError("Не удалось локализовать корень уравнения электронейтральности на границе.")
-    idx = sign_changes[0]
-    root_val, res = brentq(func, grid[idx], grid[idx + 1], xtol=1e-14, rtol=1e-14, full_output=True)
-    if not res.converged:
-        raise RuntimeError("brentq не сошелся при расчете граничных условий.")
-    return root_val
+        eu = np.exp(u)
+        return u * (c_o * eu - c_f) / (eu - 1.0)
 
 
-def compute_boundary_concentrations(electrode, ic, TC, Rp, Ph2, Ph2o, Po2, Cd, params):
-    """
-    Расчет безразмерных граничных концентраций (C * Vm) с учетом
-    поляризационного сопротивления электрода Rp при плотности тока ic (А/см^2).
-    """
-    TK = TC + 273.15
-    Kph2o = params['Kph2o']
-    Kpo2 = params['Kpo2']
-    Kph2 = params['Kph2']
-    Kpeh = params['Kpeh']
-
-    Cv = _find_bracket_and_solve(
-        lambda x: _charge_balance_residual(x, electrode, Ph2, Ph2o, Po2, Cd, params)
-    )
-
-    a = 1.0 / (Kph2o * Ph2o * Cv)
-    Coh = (-1.0 + np.sqrt(max(1.0 - 4.0 * a * (Cv - 3.0), 0.0))) / (2.0 * a)
-    Co = (Coh**2) / (Kph2o * Ph2o * Cv)
-
-    if electrode == 'oxygen':
-        Ch = np.sqrt(Cv * Kpo2 * np.sqrt(Po2) / Co)
-        Ce = Kpeh / Ch
-        Ce_b = Ce * np.exp(+np.arcsinh(ic * Rp * F_CONST / (R_GAS * TK)))
+def profile_exp(x_norm: np.ndarray, u: float, c_f: float, c_o: float) -> np.ndarray:
+    """Устойчивый аналитический профиль концентрации c(x/L) при постоянном поле."""
+    if abs(u) < 1e-6:
+        return c_f + (c_o - c_f) * x_norm
+    elif u > 0:
+        return c_f + (c_o - c_f) * (1.0 - np.exp(-u * x_norm)) / (1.0 - np.exp(-u))
     else:
-        Ce = Kph2 * np.sqrt(Ph2) * Co / Coh
-        Ch = Kpeh / Ce
-        Ce_b = Ce * np.exp(-np.arcsinh(ic * Rp * F_CONST / (R_GAS * TK)))
-
-    Ch_b = Kpeh / Ce_b
-    Cv_b = Ce_b + Cd - Ch_b - (3.0 - Co)
-    Cp_b = 3.0 - Co - Cv_b
-    PO2_b = (Co * (Ch_b**2) / (Kpo2 * Cv_b))**2
-
-    return {
-        'Ce': Ce_b, 'Ch': Ch_b, 'Cp': Cp_b, 'Cv': Cv_b, 'Co': Co, 'PO2': PO2_b
-    }
+        return c_o + (c_f - c_o) * (1.0 - np.exp(u * (1.0 - x_norm))) / (1.0 - np.exp(u))
 
 
-# ==============================================================================
-# 2. БЫСТРЫЙ РАЗРЕЖЕННЫЙ РЕШАТЕЛЬ НЬЮТОНА-РАФСОНА (Прямой LU / spsolve)
-# ==============================================================================
-
-def compute_right_boundary_potential(y_last, y_prev, icg, bc_O, params):
+def compute_gas_fluxes(J_p, J_v, p_H2_f, p_H2O_f, p_O2_f):
     """
-    Вычисление безразмерного потенциала на правой границе (PhiOH)
-    из условия равенства полного электрического тока заданному току icg.
+    Газовые потоки на водородной стороне (моль/(м^2*с)) по Thatte (2024) / Restrepo (2026).
     """
-    Dh, De, Dv, Dp = params['Dh'], params['De'], params['Dv'], params['Dp']
-    zh, ze, zv, zp = 1.0, -1.0, 2.0, 1.0
-    dx = params['dx']
-    Kpeh = params['Kpeh']
+    p_H2O_f = max(p_H2O_f, 1e-12)
+    p_O2_f = max(p_O2_f, 1e-35)
+    p_H2_f = max(p_H2_f, 1e-12)
 
-    Ch_N = y_last[0]**2
-    Ce_N = Kpeh / Ch_N
-    Cv_N = y_last[1]**2
-    Cp_N = y_last[2]**2
+    term_p = 2.0 + 2.0 * (p_H2_f / p_H2O_f) + 0.5 * (p_H2_f / p_O2_f)
+    term_v = 1.0 + 4.0 * (p_O2_f / p_H2O_f) + 4.0 * (p_O2_f / p_H2_f)
 
-    Ch_prev = y_prev[0]**2
-    Ce_prev = Kpeh / Ch_prev
-    Cv_prev = y_prev[1]**2
-    Cp_prev = y_prev[2]**2
-
-    sum_CF = (
-        Dh * zh * (bc_O['Ch'] - Ch_prev)
-        + De * ze * (bc_O['Ce'] - Ce_prev)
-        + Dv * zv * (bc_O['Cv'] - Cv_prev)
-        + Dp * zp * (bc_O['Cp'] - Cp_prev)
-    )
-    sigma_N = (
-        Dh * (zh**2) * Ch_N
-        + De * (ze**2) * Ce_N
-        + Dv * (zv**2) * Cv_N
-        + Dp * (zp**2) * Cp_N
-    )
-    PhiOH = y_prev[3] - 2.0 * dx * (icg + sum_CF / (2.0 * dx)) / sigma_N
-    return PhiOH
+    J_H2O = J_p / term_p - J_v / term_v
+    J_H2 = 0.5 * J_p - J_H2O
+    J_O2 = -0.5 * J_v - 0.5 * J_H2O
+    return J_H2, J_H2O, J_O2
 
 
-def steady_residual(y_flat, icg, bc_H, bc_O, params):
-    """Векторизованный вектор невязок стационарной системы Нернста-Планка-Пуассона."""
-    N = params['NumGrid']
-    dx = params['dx']
-    Dh, De, Dv, Dp = params['Dh'], params['De'], params['Dv'], params['Dp']
-    zh, ze, zv, zp = 1.0, -1.0, 2.0, 1.0
-    Kpeh = params['Kpeh']
-    eps_term = params['epsilon0'] * params['epsilonr']
-    Cd = params['Cd']
-
-    y = y_flat.reshape((N, 4))
-    res = np.empty_like(y)
-
-    # Переход от корней к безразмерным концентрациям (гарантия C >= 0)
-    Ch = y[:, 0]**2
-    Ce = Kpeh / Ch
-    Cv = y[:, 1]**2
-    Cp = y[:, 2]**2
-    Phi = y[:, 3]
-
-    # Граничные значения концентраций и потенциалов
-    PhiH = 0.0
-    PhiOH = compute_right_boundary_potential(y[-1], y[-2], icg, bc_O, params)
-
-    Ch_ext = np.concatenate(([bc_H['Ch']], Ch, [bc_O['Ch']]))
-    Ce_ext = np.concatenate(([bc_H['Ce']], Ce, [bc_O['Ce']]))
-    Cv_ext = np.concatenate(([bc_H['Cv']], Cv, [bc_O['Cv']]))
-    Cp_ext = np.concatenate(([bc_H['Cp']], Cp, [bc_O['Cp']]))
-    Phi_ext = np.concatenate(([PhiH], Phi, [PhiOH]))
-
-    def flux_div(C_ext, D_val, z_val):
-        diff_right = 2.0 * D_val * (C_ext[2:] - C_ext[1:-1])
-        diff_left = 2.0 * D_val * (C_ext[1:-1] - C_ext[:-2])
-
-        migr_right = z_val * D_val * (C_ext[2:] + C_ext[1:-1]) * (Phi_ext[2:] - Phi_ext[1:-1])
-        migr_left = z_val * D_val * (C_ext[:-2] + C_ext[1:-1]) * (Phi_ext[1:-1] - Phi_ext[:-2])
-
-        return (diff_right - diff_left) + (migr_right - migr_left)
-
-    # 1. Сохранение электронного заряда (нормируем на max(Dh, De) для сбалансированного якобиана)
-    scale_el = max(Dh, De, 1.0)
-    res[:, 0] = (zh * flux_div(Ch_ext, Dh, zh) + ze * flux_div(Ce_ext, De, ze)) / scale_el
-
-    # 2. Сохранение кислородных вакансий
-    res[:, 1] = flux_div(Cv_ext, Dv, zv) / max(Dv, 1.0)
-
-    # 3. Сохранение протонных дефектов
-    res[:, 2] = flux_div(Cp_ext, Dp, zp)
-
-    # 4. Уравнение электронейтральности / Пуассона (масштабировано на 2*dx^2, как и уравнения потоков)
-    d2_phi = Phi_ext[2:] - 2.0 * Phi_ext[1:-1] + Phi_ext[:-2]
-    charge_density = zh * Ch + ze * Ce + zv * Cv + zp * Cp - Cd
-    res[:, 3] = 2.0 * eps_term * d2_phi + (2.0 * dx * dx) * charge_density
-
-    return res.ravel()
-
-
-def compute_compressed_sparse_jacobian(y_flat, f0, icg, bc_H, bc_O, params):
-    """
-    Сверхбыстрый расчет разреженного якобиана методом сжатия столбцов (graph coloring).
-    Вместо 4*N = 800 вызовов residual требуется всего 12 вызовов!
-    """
-    N = params['NumGrid']
-    n_vars = 4 * N
-    rows = []
-    cols = []
-    vals = []
-
-    # 3 группы ячеек по модулю 3 (i % 3 = 0, 1, 2) + 4 переменные в ячейке = 12 цветов
-    for mod_idx in range(3):
-        for var_idx in range(4):
-            pert_indices = np.arange(mod_idx, N, 3) * 4 + var_idx
-            y_pert = y_flat.copy()
-            # Относительный сдвиг с защитой от нулевых значений
-            step = 1e-7 * np.maximum(np.abs(y_flat[pert_indices]), 1e-3)
-            y_pert[pert_indices] += step
-
-            f_pert = steady_residual(y_pert, icg, bc_H, bc_O, params)
-            df = (f_pert - f0)
-
-            for idx_in_group, col_idx in enumerate(pert_indices):
-                cell_i = col_idx // 4
-                h = step[idx_in_group]
-                # Диапазон затронутых ячеек: [cell_i - 1, cell_i + 1]
-                # Плюс для последних двух ячеек (N-2, N-1) учитываем связь через PhiOH
-                i_start = max(0, cell_i - 1)
-                i_end = min(N, cell_i + 2)
-                if cell_i >= N - 2:
-                    i_end = N
-                    i_start = min(i_start, N - 2)
-
-                r_idx = np.arange(4 * i_start, 4 * i_end)
-                rows.append(r_idx)
-                cols.append(np.full_like(r_idx, col_idx))
-                vals.append(df[r_idx] / h)
-
-    J_csc = csc_matrix(
-        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-        shape=(n_vars, n_vars)
-    )
-    return J_csc
-
-
-def solve_newton_sparse(y0_flat, icg, bc_H, bc_O, params, tol=1e-10, max_iter=40):
-    """
-    Решает F(y) = 0 методом Ньютона-Рафсона с прямым разреженным LU-разложением (spsolve)
-    и поиском шага Армихо (damped Newton). Сходится за 5-12 итераций (~15 мс).
-    """
-    N = params['NumGrid']
-    y = y0_flat.copy()
-    f = steady_residual(y, icg, bc_H, bc_O, params)
-    norm_f = np.max(np.abs(f))
-
-    if norm_f < tol:
-        return y, norm_f, 0
-
-    for it in range(1, max_iter + 1):
-        J = compute_compressed_sparse_jacobian(y, f, icg, bc_H, bc_O, params)
-        try:
-            delta = spsolve(J, -f)
-        except Exception as exc:
-            raise RuntimeError(f"Сингулярная матрица Якоби на итерации {it}: {exc}")
-
-        if not np.all(np.isfinite(delta)):
-            raise RuntimeError(f"NaN/Inf в шаге Ньютона на итерации {it}.")
-
-        # Ограничиваем максимальный шаг по потенциалу (в единицах kT/e) и концентрациям
-        delta_2d = delta.reshape((N, 4))
-        max_dphi = np.max(np.abs(delta_2d[:, 3]))
-        scale_limit = 1.0
-        if max_dphi > 2.0:
-            scale_limit = 2.0 / max_dphi
-
-        # Демпфирование шага (линейный поиск Армихо)
-        alpha = scale_limit
-        accepted = False
-        for _ in range(15):
-            y_trial = y + alpha * delta
-            # Защита от деления на ноль при Ch = y[:,0]^2
-            y_trial_2d = y_trial.reshape((N, 4))
-            y_trial_2d[:, 0] = np.where(np.abs(y_trial_2d[:, 0]) < 1e-14, 1e-14, y_trial_2d[:, 0])
-            y_trial = y_trial_2d.ravel()
-
-            f_trial = steady_residual(y_trial, icg, bc_H, bc_O, params)
-            norm_trial = np.max(np.abs(f_trial))
-
-            if np.isfinite(norm_trial) and norm_trial < norm_f * (1.0 - 1e-4 * alpha):
-                y = y_trial
-                f = f_trial
-                norm_f = norm_trial
-                accepted = True
-                break
-            alpha *= 0.5
-
-        if not accepted:
-            # Если мы уже близко к решению (norm_f < 1e-2), делаем полный шаг Ньютона без затухания
-            step_factor = scale_limit if norm_f < 1e-2 else 1e-2 * scale_limit
-            y = y + step_factor * delta
-            y_2d = y.reshape((N, 4))
-            y_2d[:, :3] = np.abs(y_2d[:, :3])
-            y_2d[:, 0] = np.maximum(y_2d[:, 0], 1e-14)
-            y = y_2d.ravel()
-            f = steady_residual(y, icg, bc_H, bc_O, params)
-            norm_f = np.max(np.abs(f))
-
-        # Нормализуем знак корней концентраций (y^2 инвариантно к знаку)
-        y_2d = y.reshape((N, 4))
-        y_2d[:, :3] = np.abs(y_2d[:, :3])
-        y = y_2d.ravel()
-
-        if norm_f < tol or (np.max(np.abs(alpha * delta)) < 1e-9 and norm_f < 1e-5):
-            return y, norm_f, it
-
-    if norm_f > 1e-4:
-        raise RuntimeError(f"Метод Ньютона не достиг точности за {max_iter} итераций (max_res = {norm_f:.2e}).")
-    return y, norm_f, max_iter
-
-
-@st.cache_data(show_spinner=False)
-def solve_transport_steady(
-    icu, Temp, Thick, RpH, RpH2O, Phh2o, Phh2, Psh2o, Pso2, Cd, P_tuple,
-    num_grid=200, n_continuation_steps=5
+def solve_single_point(
+    i_A_cm2: float,
+    T_C: float,
+    L_um: float,
+    Rp_H: float,
+    Rp_O: float,
+    p_H2_f: float,
+    p_H2O_f: float,
+    p_H2O_o: float,
+    c_R: float,
+    mat: dict,
+    solver_mode: str = "fast",
+    use_arcsinh_shift: bool = True,
+    n_grid: int = 80,
 ):
     """
-    Решает стационарную 1D задачу электрохимического переноса в электролите.
-    Выполняется за ~30-60 мс благодаря прямому разреженному решателю Ньютона.
+    Единый решатель для PCFC (i>0), OCV (i=0) и PCEC (i<0).
+    Возвращает словарь со всеми скалярными метриками и 1D-профилями по x/L.
     """
-    P_vec = np.array(P_tuple, dtype=float)
-    TK = Temp + 273.15
-    Dpd, Dvd, Dhd, Ded = P_vec[0], P_vec[1], P_vec[2], P_vec[3]
-    Kph2o, Kpo2, Kph2, Kpeh = P_vec[4], P_vec[5], P_vec[6], P_vec[7]
+    T_K = T_C + 273.15
+    L_m = L_um * 1e-6
+    Vm = mat["Vm"]
+    i_A_m2 = i_A_cm2 * 1e4  # А/м^2
 
-    dx = 1.0 / num_grid
-    epsilon0 = 100.0
-    epsilonr = 100.0 * VM_4411 * R_GAS * TK / (F_CONST**2 * Thick**2)
+    K_W, K_H2O, K_O2, D_p, D_v, D_h = get_material_props(T_K, mat)
 
-    params = {
-        'NumGrid': num_grid, 'dx': dx, 'Cd': Cd,
-        'Dh': Dhd / Dpd, 'De': Ded / Dpd, 'Dv': Dvd / Dpd, 'Dp': 1.0,
-        'Kph2o': Kph2o, 'Kpo2': Kpo2, 'Kph2': Kph2, 'Kpeh': Kpeh,
-        'epsilon0': epsilon0, 'epsilonr': epsilonr
-    }
+    # Газофазное равновесие на границах
+    p_O2_o = max(0.21 * (1.0 - p_H2O_o), 1e-12)
+    p_O2_f = (p_H2O_f / (K_W * max(p_H2_f, 1e-12))) ** 2
+    p_H2_o = p_H2O_o / (K_W * np.sqrt(p_O2_o))
 
-    # Шаг 1: Начальное приближение при разомкнутой цепи (OCV, i = 0)
-    bc_H_ocv = compute_boundary_concentrations('hydrogen', 0.0, Temp, RpH, Phh2, Phh2o, 0.0, Cd, params)
-    bc_O_ocv = compute_boundary_concentrations('oxygen', 0.0, Temp, RpH2O, 0.0, Psh2o, Pso2, Cd, params)
+    # Равновесные концентрации (i=0)
+    pf_eq, vf_eq, hf_eq, of_eq = solve_boundary_defects(p_H2O_f, p_O2_f, c_R, K_H2O, K_O2)
+    po_eq, vo_eq, ho_eq, oo_eq = solve_boundary_defects(p_H2O_o, p_O2_o, c_R, K_H2O, K_O2)
 
-    s = np.linspace(0.0, 1.0, num_grid)
-    y0 = np.zeros((num_grid, 4))
-    y0[:, 0] = np.sqrt(bc_H_ocv['Ch']) + s * (np.sqrt(bc_O_ocv['Ch']) - np.sqrt(bc_H_ocv['Ch']))
-    y0[:, 1] = np.sqrt(bc_H_ocv['Cv']) + s * (np.sqrt(bc_O_ocv['Cv']) - np.sqrt(bc_H_ocv['Cv']))
-    y0[:, 2] = np.sqrt(bc_H_ocv['Cp']) + s * (np.sqrt(bc_O_ocv['Cp']) - np.sqrt(bc_H_ocv['Cp']))
-    y0[:, 3] = s * np.log(bc_O_ocv['Ce'] / bc_H_ocv['Ce'])
+    # Равновесный (нернстовский) потенциал E_eq [В]
+    E_eq = (R_GAS * T_K / F_CONST) * np.log((ho_eq / oo_eq) / (hf_eq / of_eq))
 
-    y_flat, max_res, total_iters = solve_newton_sparse(
-        y0.ravel(), 0.0, bc_H_ocv, bc_O_ocv, params, tol=1e-10, max_iter=50
-    )
-    y_curr = y_flat.reshape((num_grid, 4))
+    # Перенапряжение электродов (Батлер-Фольмер arcsinh)
+    eta_H = (R_GAS * T_K / F_CONST) * np.arcsinh((i_A_cm2 * Rp_H * F_CONST) / (R_GAS * T_K)) if Rp_H > 0 else 0.0
+    eta_O = (R_GAS * T_K / F_CONST) * np.arcsinh((i_A_cm2 * Rp_O * F_CONST) / (R_GAS * T_K)) if Rp_O > 0 else 0.0
 
-    # Профили при OCV до нагружения током
-    Cv_ocv = y_curr[:, 1]**2
-    Cp_ocv = y_curr[:, 2]**2
-    Co_ocv = 3.0 - Cv_ocv - Cp_ocv
-    PO2_ocv = (Co_ocv * (y_curr[:, 0]**4) / (Cv_ocv * Kpo2))**2
-
-    # Шаг 2: Параметрическое продолжение по току от 0 до icu
-    if abs(icu) > 1e-12:
-        currents_ramp = np.linspace(0.0, icu, n_continuation_steps + 1)[1:]
+    # Сдвиг граничных концентраций (если включен) через эффективное p_O2
+    if use_arcsinh_shift and (Rp_H > 0 or Rp_O > 0):
+        shift_f = np.clip(4.0 * F_CONST * eta_H / (R_GAS * T_K), -25.0, 25.0)
+        shift_o = np.clip(-4.0 * F_CONST * eta_O / (R_GAS * T_K), -25.0, 25.0)
+        pf, vf, hf, of = solve_boundary_defects(p_H2O_f, p_O2_f * np.exp(shift_f), c_R, K_H2O, K_O2)
+        po, vo, ho, oo = solve_boundary_defects(p_H2O_o, p_O2_o * np.exp(shift_o), c_R, K_H2O, K_O2)
     else:
-        currents_ramp = []
+        pf, vf, hf, of = pf_eq, vf_eq, hf_eq, of_eq
+        po, vo, ho, oo = po_eq, vo_eq, ho_eq, oo_eq
 
-    bc_H, bc_O = bc_H_ocv, bc_O_ocv
-    for ic_step in currents_ramp:
-        icg_step = ic_step * Thick * VM_4411 / (Dpd * F_CONST) * 1e4
-        bc_H = compute_boundary_concentrations('hydrogen', ic_step, Temp, RpH, Phh2, Phh2o, 0.0, Cd, params)
-        bc_O = compute_boundary_concentrations('oxygen', ic_step, Temp, RpH2O, 0.0, Psh2o, Pso2, Cd, params)
+    # Молярные концентрации на границах [моль/м^3]
+    cf_p, cf_v, cf_h = pf / Vm, vf / Vm, hf / Vm
+    co_p, co_v, co_h = po / Vm, vo / Vm, ho / Vm
 
-        y_flat, max_res, it_step = solve_newton_sparse(
-            y_curr.ravel(), icg_step, bc_H, bc_O, params, tol=1e-10, max_iter=80
-        )
-        total_iters += it_step
-        y_curr = y_flat.reshape((num_grid, 4))
+    # --- ШАГ 1: БЫСТРЫЙ АЛГЕБРАИЧЕСКИЙ РЕШАТЕЛЬ (ПОСТОЯННОЕ ПОЛЕ) ---
+    def total_current_alg(dPhi_V):
+        u1 = F_CONST * dPhi_V / (R_GAS * T_K)
+        u2 = 2.0 * u1
+        Jp = -(D_p / L_m) * bernoulli_flux(u1, cf_p, co_p)
+        Jv = -(D_v / L_m) * bernoulli_flux(u2, cf_v, co_v)
+        Jh = -(D_h / L_m) * bernoulli_flux(u1, cf_h, co_h)
+        return F_CONST * (Jp + 2.0 * Jv + Jh) - i_A_m2
 
-    # Шаг 3: Сборка полных профилей (длина N + 2)
-    ic_final_dimless = icu * Thick * VM_4411 / (Dpd * F_CONST) * 1e4
-    PhiH = 0.0
-    PhiOH = compute_right_boundary_potential(y_curr[-1], y_curr[-2], ic_final_dimless, bc_O, params)
+    # Поиск границ корня для dPhi
+    lo, hi = -3.0, 3.0
+    f_lo, f_hi = total_current_alg(lo), total_current_alg(hi)
+    for _ in range(10):
+        if f_lo * f_hi < 0:
+            break
+        lo *= 2.0
+        hi *= 2.0
+        f_lo, f_hi = total_current_alg(lo), total_current_alg(hi)
 
-    Ch_dimless = np.concatenate(([bc_H['Ch']], y_curr[:, 0]**2, [bc_O['Ch']]))
-    Ce_dimless = np.concatenate(([bc_H['Ce']], Kpeh / (y_curr[:, 0]**2), [bc_O['Ce']]))
-    Cv_dimless = np.concatenate(([bc_H['Cv']], y_curr[:, 1]**2, [bc_O['Cv']]))
-    Cp_dimless = np.concatenate(([bc_H['Cp']], y_curr[:, 2]**2, [bc_O['Cp']]))
-    Phi_dimless = np.concatenate(([PhiH], y_curr[:, 3], [PhiOH]))
+    dPhi_alg = brentq(total_current_alg, lo, hi, xtol=1e-10, rtol=1e-10)
+    u1_alg = F_CONST * dPhi_alg / (R_GAS * T_K)
+    u2_alg = 2.0 * u1_alg
 
-    Co_dimless = 3.0 - Cv_dimless - Cp_dimless
-    PO2S = (Co_dimless * (Ch_dimless**2) / (Cv_dimless * Kpo2))**2
-    PH2S = (Cp_dimless * Ce_dimless / (Co_dimless * Kph2))**2
-    PH2OS = (Cp_dimless**2) / (Co_dimless * Cv_dimless * Kph2o)
+    x_norm = np.linspace(0.0, 1.0, n_grid)
+    cp_prof = profile_exp(x_norm, u1_alg, pf, po)
+    cv_prof = profile_exp(x_norm, u2_alg, vf, vo)
+    ch_prof = profile_exp(x_norm, u1_alg, hf, ho)
+    Phi_prof = dPhi_alg * x_norm
+    E_field_prof = np.full_like(x_norm, -dPhi_alg / L_m)
 
-    # Шаг 4: Консервативный расчет парциальных токов на гранях ячеек (N + 1 грань)
-    step_sizes = np.full(num_grid + 1, dx)
-    step_sizes[0] = 0.5 * dx
-    step_sizes[-1] = 0.5 * dx
+    J_p = -(D_p / L_m) * bernoulli_flux(u1_alg, cf_p, co_p)
+    J_v = -(D_v / L_m) * bernoulli_flux(u2_alg, cf_v, co_v)
+    J_h = -(D_h / L_m) * bernoulli_flux(u1_alg, cf_h, co_h)
+    bvp_converged = True
 
-    def edge_current(C_ext, D_val, z_val):
-        dC = C_ext[1:] - C_ext[:-1]
-        dPhi = Phi_dimless[1:] - Phi_dimless[:-1]
-        C_mid = 0.5 * (C_ext[1:] + C_ext[:-1])
-        j_dimless = -z_val * D_val * (dC / step_sizes) - (z_val**2) * D_val * C_mid * (dPhi / step_sizes)
-        return j_dimless * Dpd * (1.0 / VM_4411) * F_CONST / Thick * 1e-4
+    # --- ШАГ 2: ТОЧНЫЙ 1D BVP РЕШАТЕЛЬ (ПЕРЕМЕННОЕ ПОЛЕ + ПУАССОН) ---
+    if solver_mode == "bvp":
+        Dp_nd = 1.0
+        Dv_nd = D_v / D_p
+        Dh_nd = D_h / D_p
+        i_nd = i_A_m2 * L_m * Vm / (D_p * F_CONST)
+        # Регуляризованный параметр Пуассона (как в MATLAB-коде)
+        eps_reg = max(100.0 * Vm * R_GAS * T_K / (F_CONST ** 2 * L_m ** 2), 1e-4)
 
-    ih = edge_current(Ch_dimless, params['Dh'], 1.0)
-    ie = edge_current(Ce_dimless, params['De'], -1.0)
-    iv = edge_current(Cv_dimless, params['Dv'], 2.0)
-    ip = edge_current(Cp_dimless, params['Dp'], 1.0)
+        Jp_nd0 = J_p * L_m * Vm / D_p
+        Jv_nd0 = J_v * L_m * Vm / D_p
+        Jh_nd0 = J_h * L_m * Vm / D_p
 
-    i_total = ih + ie + iv + ip
-    if abs(icu) > 1e-12:
-        current_conservation_err = float(np.max(np.abs(i_total - icu)) / abs(icu))
-        re = ie / i_total
-        rh = ih / i_total
-        rv = iv / i_total
-        rp = ip / i_total
-        FE_mean = float(np.mean(rp[1:-1]))
-        FE_std = float(np.std(rp[1:-1]))
+        def ode_rhs(x, y):
+            # y = [cp, cv, ch, Jp, Jv, Jh, Phi_nd, dPhi_dx_nd]
+            cp, cv, ch, Jp_n, Jv_n, Jh_n, Phi_n, dPhi_n = y
+            dcp = -Jp_n / Dp_nd - 1.0 * cp * dPhi_n
+            dcv = -Jv_n / Dv_nd - 2.0 * cv * dPhi_n
+            dch = -Jh_n / Dh_nd - 1.0 * ch * dPhi_n
+            zeros = np.zeros_like(x)
+            d2Phi = -(cp + 2.0 * cv + ch - c_R) / eps_reg
+            return np.vstack([dcp, dcv, dch, zeros, zeros, zeros, dPhi_n, d2Phi])
+
+        def bc_func(ya, yb):
+            return np.array([
+                ya[0] - pf, ya[1] - vf, ya[2] - hf,
+                yb[0] - po, yb[1] - vo, yb[2] - ho,
+                ya[6] - 0.0,
+                (yb[3] + 2.0 * yb[4] + yb[5]) - i_nd,
+            ])
+
+        y_init = np.vstack([
+            cp_prof, cv_prof, ch_prof,
+            np.full_like(x_norm, Jp_nd0),
+            np.full_like(x_norm, Jv_nd0),
+            np.full_like(x_norm, Jh_nd0),
+            u1_alg * x_norm,
+            np.full_like(x_norm, u1_alg),
+        ])
+
+        sol = solve_bvp(ode_rhs, bc_func, x_norm, y_init, tol=1e-4, max_nodes=1500)
+        if sol.success:
+            y_sol = sol.sol(x_norm)
+            cp_prof = np.maximum(y_sol[0], 1e-18)
+            cv_prof = np.maximum(y_sol[1], 1e-18)
+            ch_prof = np.maximum(y_sol[2], 1e-18)
+            J_p = float(np.mean(y_sol[3])) * D_p / (L_m * Vm)
+            J_v = float(np.mean(y_sol[4])) * D_p / (L_m * Vm)
+            J_h = float(np.mean(y_sol[5])) * D_p / (L_m * Vm)
+            Phi_prof = y_sol[6] * (R_GAS * T_K / F_CONST)
+            E_field_prof = -y_sol[7] * (R_GAS * T_K / (F_CONST * L_m))
+            dPhi_final = float(Phi_prof[-1] - Phi_prof[0])
+        else:
+            bvp_converged = False
+            dPhi_final = dPhi_alg
     else:
-        current_conservation_err = float(np.max(np.abs(i_total)))
-        re = np.zeros_like(i_total)
-        rh = np.zeros_like(i_total)
-        rv = np.zeros_like(i_total)
-        rp = np.zeros_like(i_total)
-        FE_mean = 0.0
-        FE_std = 0.0
+        dPhi_final = dPhi_alg
 
-    ChS = Ch_dimless / VM_4411
-    CeS = Ce_dimless / VM_4411
-    CvS = Cv_dimless / VM_4411
-    CpS = Cp_dimless / VM_4411
-    CoS = Co_dimless / VM_4411
-    PhiS = Phi_dimless * (R_GAS * TK / F_CONST)
+    # --- ВЫХОДНЫЕ ВЕЛИЧИНЫ ---
+    co_prof = np.maximum(3.0 - cp_prof - cv_prof - ch_prof, 1e-12)
 
-    V_cell = float((R_GAS * TK / F_CONST) * (np.log(CeS[0]) - np.log(CeS[-1])) + (PhiS[-1] - PhiS[0]))
+    # Парциальные проводимости по толщине [См/см]
+    pref = (F_CONST ** 2 / (R_GAS * T_K * Vm)) * 1e-2  # См/м -> См/см
+    sig_p_prof = pref * (1.0 ** 2) * cp_prof * D_p
+    sig_v_prof = pref * (2.0 ** 2) * cv_prof * D_v
+    sig_h_prof = pref * (1.0 ** 2) * ch_prof * D_h
+    sig_tot_prof = sig_p_prof + sig_v_prof + sig_h_prof
 
-    x_nodes = np.concatenate(([0.0], (np.arange(num_grid) + 0.5) * dx, [1.0]))
-    x_edges = np.linspace(0.0, 1.0, num_grid + 1)
+    # Внутренние парциальные давления газов по толщине [атм]
+    p_H2O_int = (cp_prof ** 2) / (co_prof * cv_prof * K_H2O)
+    p_O2_int = ((ch_prof ** 2) / (co_prof * cv_prof * K_O2)) ** 2
+    p_H2_int = p_H2O_int / (K_W * np.sqrt(np.maximum(p_O2_int, 1e-35)))
+
+    # Парциальные плотности токов [А/см^2]
+    i_p = (1.0 * F_CONST * J_p) * 1e-4
+    i_v = (2.0 * F_CONST * J_v) * 1e-4
+    i_h = (1.0 * F_CONST * J_h) * 1e-4
+    i_tot = i_p + i_v + i_h
+
+    # Напряжение на ячейке [В]
+    # Если сдвиг границ включен, перенапряжение уже учтено в разности химических потенциалов h на границах;
+    # иначе вычитаем eta_H + eta_O явно.
+    if use_arcsinh_shift and (Rp_H > 0 or Rp_O > 0):
+        E_cell_shifted = (R_GAS * T_K / F_CONST) * np.log((ho / oo) / (hf / of))
+        V_cell = E_cell_shifted + dPhi_final
+    else:
+        V_cell = E_eq + dPhi_final - (eta_H + eta_O)
+
+    # Газовые потоки и Фарадеевская эффективность (единая для PCFC и PCEC)
+    J_H2, J_H2O, J_O2 = compute_gas_fluxes(J_p, J_v, p_H2_f, p_H2O_f, p_O2_f)
+    i_H2_equiv = (2.0 * F_CONST * J_H2) * 1e-4  # А/см^2
+
+    if i_A_cm2 > 1e-6:  # PCFC
+        FE = (i_tot / i_H2_equiv) if abs(i_H2_equiv) > 1e-12 else 0.0
+        mode_str = "PCFC (Fuel Cell)"
+    elif i_A_cm2 < -1e-6:  # PCEC
+        FE = (i_H2_equiv / i_tot) if abs(i_tot) > 1e-12 else 0.0
+        mode_str = "PCEC (Electrolyzer)"
+    else:  # OCV
+        FE = 0.0
+        mode_str = "OCV (Open Circuit)"
+
+    # Числа переноса (по проводимости, осредненные по толщине, и по току)
+    t_p_cond = float(np.mean(sig_p_prof / sig_tot_prof))
+    t_v_cond = float(np.mean(sig_v_prof / sig_tot_prof))
+    t_h_cond = float(np.mean(sig_h_prof / sig_tot_prof))
+
+    # Тепловой баланс [Вт/см^2] и КПД по LHV
+    # q_dot > 0: экзотермический (выделение тепла), q_dot < 0: эндотермический (поглощение)
+    J_H2_cm2 = J_H2 * 1e-4
+    q_dot = -i_tot * V_cell + J_H2_cm2 * abs(DH_W)
+    V_TN_theo = abs(DH_W) / (2.0 * F_CONST)
+    V_TN_act = max(FE, 0.0) * V_TN_theo if i_A_cm2 < -1e-6 else V_TN_theo
+
+    P_elec = i_tot * V_cell  # Вт/см^2 (>0 в PCFC, <0 в PCEC)
+    if i_A_cm2 > 1e-6:
+        eff_LHV = P_elec / (J_H2_cm2 * LHV_H2) if J_H2_cm2 > 1e-12 else 0.0
+    elif i_A_cm2 < -1e-6:
+        Q_in = max(0.0, -q_dot)
+        denom_ec = abs(P_elec) + Q_in
+        eff_LHV = (abs(J_H2_cm2) * LHV_H2) / denom_ec if denom_ec > 1e-12 else 0.0
+    else:
+        eff_LHV = 0.0
 
     return {
-        'x_nodes': x_nodes, 'x_edges': x_edges,
-        'Ce': CeS, 'Ch': ChS, 'Cp': CpS, 'Cv': CvS, 'Co': CoS,
-        'Phi': PhiS, 'V': V_cell,
-        'pO2': PO2S, 'pH2': PH2S, 'pH2O': PH2OS,
-        'Co_OCV': Co_ocv / VM_4411, 'pO2_OCV': PO2_ocv,
-        'electron_current': re, 'hole_current': rh,
-        'proton_current': rp, 'vacancy_current': rv,
-        'ie_abs': ie, 'ih_abs': ih, 'iv_abs': iv, 'ip_abs': ip,
-        'i_total': i_total,
-        'FE_mean': FE_mean, 'FE_std': FE_std,
-        'current_conservation_err': current_conservation_err,
-        'max_residual': float(max_res),
-        'newton_iters': int(total_iters)
+        "mode": mode_str,
+        "bvp_converged": bvp_converged,
+        "T_C": T_C, "i": i_tot, "V_cell": V_cell, "E_eq": E_eq,
+        "dPhi": dPhi_final, "eta_H": eta_H, "eta_O": eta_O,
+        "i_p": i_p, "i_v": i_v, "i_h": i_h,
+        "t_p": t_p_cond, "t_v": t_v_cond, "t_h": t_h_cond,
+        "FE": FE * 100.0, "eff_LHV": eff_LHV * 100.0,
+        "P_elec": P_elec, "q_dot": q_dot,
+        "V_TN_theo": V_TN_theo, "V_TN_act": V_TN_act,
+        "J_H2": J_H2_cm2, "J_H2O": J_H2O * 1e-4, "J_O2": J_O2 * 1e-4,
+        # Профили по x/L
+        "x_norm": x_norm, "cp": cp_prof, "cv": cv_prof, "ch": ch_prof, "co": co_prof,
+        "Phi": Phi_prof, "E_field": E_field_prof,
+        "sig_p": sig_p_prof, "sig_v": sig_v_prof, "sig_h": sig_h_prof, "sig_tot": sig_tot_prof,
+        "p_H2O_int": p_H2O_int, "p_O2_int": p_O2_int, "p_H2_int": p_H2_int,
     }
 
 
-# ==============================================================================
-# 3. ЗАГРУЗКА ПАРАМЕТРОВ ИЗ РЕПОЗИТОРИЯ
-# ==============================================================================
+# =============================================================================
+# 3. БОКОВАЯ ПАНЕЛЬ (ВХОДНЫЕ ПАРАМЕТРЫ + НАСТРОЙКА ГРАФИКОВ)
+# =============================================================================
+st.sidebar.title("⚙️ Параметры модели")
 
-def load_mat_parameters(uploaded_file=None):
-    """Ищет example_parameters_4411.mat в стандартных путях GitHub-репозитория или берет загруженный."""
-    if uploaded_file is not None:
-        mat_data = sio.loadmat(uploaded_file)
-        return mat_data['P'][:, 0]
+preset_name = st.sidebar.selectbox("Материал электролита", list(MATERIAL_PRESETS.keys()))
+mat_params = dict(MATERIAL_PRESETS[preset_name])
 
-    candidate_paths = [
-        'example_parameters_4411.mat',
-        os.path.join('code', 'example_parameters_4411.mat'),
-        os.path.join(os.path.dirname(__file__), 'example_parameters_4411.mat'),
-        os.path.join(os.path.dirname(__file__), 'code', 'example_parameters_4411.mat'),
-    ]
-    for path in candidate_paths:
-        if os.path.exists(path):
-            mat_data = sio.loadmat(path)
-            return mat_data['P'][:, 0]
-    return None
-
-
-def load_summary_data():
-    """Ищет figure_summary_4411.mat в стандартных путях GitHub-репозитория."""
-    candidate_paths = [
-        'figure_summary_4411.mat',
-        os.path.join('figure_data', 'figure_summary_4411.mat'),
-        os.path.join(os.path.dirname(__file__), 'figure_summary_4411.mat'),
-        os.path.join(os.path.dirname(__file__), 'figure_data', 'figure_summary_4411.mat'),
-    ]
-    for path in candidate_paths:
-        if os.path.exists(path):
-            return sio.loadmat(path)
-    return None
-
-
-# ==============================================================================
-# 4. ВИЗУАЛИЗАЦИЯ (6 ПРОФИЛЕЙ + СВОДНЫЕ BOXPLOTS АНСАМБЛЯ)
-# ==============================================================================
-
-def make_profiles_figure(results):
-    styles = ['-', '--', ':']
-    names = [f"{int(round(r['fraction']*100))}% H₂O" for r in results]
-
-    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
-    plt.subplots_adjust(hspace=0.32, wspace=0.25)
-
-    # A: Электроны и дырки
-    ax = axes[0, 0]
-    for r, st, name in zip(results, styles, names):
-        ax.semilogy(r['x_nodes'], r['Ce'], color='#1f77b4', linestyle=st, lw=1.8, label=f'e⁻ ({name})')
-        ax.semilogy(r['x_nodes'], r['Ch'], color='#d62728', linestyle=st, lw=1.8, label=f'h• ({name})')
-    ax.set_xlabel('Нормированная координата x / L')
-    ax.set_ylabel('Концентрация C_e, C_h (моль/м³)')
-    ax.set_title('A. Электронные носители заряда')
-    ax.grid(True, which='both', alpha=0.3)
-    ax.legend(ncol=2, fontsize=8.5)
-
-    # B: Протоны и вакансии
-    ax = axes[0, 1]
-    for r, st, name in zip(results, styles, names):
-        ax.plot(r['x_nodes'], r['Cp'], color='#1f77b4', linestyle=st, lw=1.8, label=f'OH• ({name})')
-        ax.plot(r['x_nodes'], r['Cv'], color='#d62728', linestyle=st, lw=1.8, label=f'v•• ({name})')
-    ax.set_xlabel('Нормированная координата x / L')
-    ax.set_ylabel('Концентрация C_p, C_v (моль/м³)')
-    ax.set_title('B. Ионные дефекты')
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2, fontsize=8.5)
-
-    # C: Электронные парциальные токи (доли)
-    ax = axes[1, 0]
-    for r, st, name in zip(results, styles, names):
-        ax.plot(r['x_edges'], r['electron_current'], color='#1f77b4', linestyle=st, lw=1.8, label=f't_e ({name})')
-        ax.plot(r['x_edges'], r['hole_current'], color='#d62728', linestyle=st, lw=1.8, label=f't_h ({name})')
-    ax.set_xlabel('Нормированная координата x / L')
-    ax.set_ylabel('Число переноса t_e, t_h')
-    ax.set_title('C. Доли электронных токов (утечка)')
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2, fontsize=8.5)
-
-    # D: Ионные парциальные токи (доли)
-    ax = axes[1, 1]
-    for r, st, name in zip(results, styles, names):
-        ax.plot(r['x_edges'], r['proton_current'], color='#1f77b4', linestyle=st, lw=1.8, label=f't_p = FE ({name})')
-        ax.plot(r['x_edges'], r['vacancy_current'], color='#d62728', linestyle=st, lw=1.8, label=f't_v ({name})')
-    ax.set_xlabel('Нормированная координата x / L')
-    ax.set_ylabel('Число переноса t_p, t_v')
-    ax.set_title('D. Доли ионных токов (Фарадеевская эффективность)')
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2, fontsize=8.5)
-
-    # E: Электростатический потенциал
-    ax = axes[2, 0]
-    for r, st, name in zip(results, styles, names):
-        ax.plot(r['x_nodes'], r['Phi'], color='#0b2545', linestyle=st, lw=1.8, label=name)
-    ax.set_xlabel('Нормированная координата x / L')
-    ax.set_ylabel('Электростатический потенциал Φ (В)')
-    ax.set_title('E. Профиль потенциала (включая границу x = L)')
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=9)
-
-    # F: Внутренние парциальные давления газов
-    ax = axes[2, 1]
-    ax_right = ax.twinx()
-    for r, st, name in zip(results, styles, names):
-        ax.semilogy(r['x_nodes'], r['pO2'], color='#2ca02c', linestyle=st, lw=1.8, label=f'pO2 ({name})')
-        ax.semilogy(r['x_nodes'], r['pH2'], color='#1f77b4', linestyle=st, lw=1.8, label=f'pH2 ({name})')
-        ax_right.plot(r['x_nodes'], r['pH2O'], color='#d62728', linestyle=st, lw=1.8, label=f'pH2O ({name})')
-    ax.set_xlabel('Нормированная координата x / L')
-    ax.set_ylabel('pO2, pH2 (атм)', color='#1f77b4')
-    ax.set_ylim([1e-30, 1e10])
-    ax_right.set_ylabel('pH2O (атм)', color='#d62728')
-    ax_right.set_ylim([0, 4])
-    ax.set_title('F. Внутренние парциальные давления газов')
-    ax.grid(True, which='both', alpha=0.3)
-
-    return fig
-
-
-def make_summary_figure(S):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
-
-    fe_groups = [S['FE_50'] * 100, S['FE_70'] * 100, S['FE_90'] * 100]
-    fe_labels = ['50%', '70%', '90%']
-    fe_colors = ['#1420EE', '#3879FF', '#85CBF5']
-    currents_1 = [-0.5, -1.0, -1.5, -2.0]
-    offsets_1 = [-0.21, 0.0, 0.21]
-
-    for grp, lbl, col, off in zip(fe_groups, fe_labels, fe_colors, offsets_1):
-        positions = np.arange(len(currents_1)) + off
-        bp = ax1.boxplot(
-            [grp[j, np.isfinite(grp[j, :])] for j in range(len(currents_1))],
-            positions=positions, widths=0.16, patch_artist=True,
-            boxprops=dict(facecolor=col, edgecolor='black'),
-            medianprops=dict(color='black', lw=1.2),
-            flierprops=dict(marker='+', markeredgecolor='red', markersize=5)
-        )
-        bp['boxes'][0].set_label(lbl)
-
-    ax1.set_xticks(range(len(currents_1)))
-    ax1.set_xticklabels([f'{c:.1f}' for c in currents_1])
-    ax1.set_ylim([50, 100])
-    ax1.set_xlabel('Плотность тока (А/см²)')
-    ax1.set_ylabel('Фарадеевская эффективность FE (%)')
-    ax1.set_title('FE при разной доле пара (50%, 70%, 90%)')
-    ax1.legend(loc='lower left', title='Доля H₂O')
-    ax1.grid(True, axis='y', alpha=0.3)
-
-    rp_groups = [S['RP_70_0']*100, S['RP_70_005']*100, S['RP_70_01']*100, S['RP_70_02']*100]
-    rp_labels = ['Rp = 0', 'Rp = 0.05', 'Rp = 0.1', 'Rp = 0.2']
-    rp_colors = ['#160FED', '#3757F0', '#5DACEF', '#9BFBFA']
-    currents_2 = [-1.0, -1.5, -2.0]
-    offsets_2 = [-0.315, -0.105, 0.105, 0.315]
-
-    for grp, lbl, col, off in zip(rp_groups, rp_labels, rp_colors, offsets_2):
-        positions = np.arange(len(currents_2)) + off
-        bp = ax2.boxplot(
-            [grp[j, np.isfinite(grp[j, :])] for j in range(len(currents_2))],
-            positions=positions, widths=0.16, patch_artist=True,
-            boxprops=dict(facecolor=col, edgecolor='black'),
-            medianprops=dict(color='black', lw=1.2),
-            flierprops=dict(marker='+', markeredgecolor='red', markersize=5)
-        )
-        bp['boxes'][0].set_label(lbl)
-
-    ax2.set_xticks(range(len(currents_2)))
-    ax2.set_xticklabels([f'{c:.1f}' for c in currents_2])
-    ax2.set_ylim([40, 100])
-    ax2.set_xlabel('Плотность тока (А/см²)')
-    ax2.set_ylabel('Фарадеевская эффективность FE (%)')
-    ax2.set_title('Чувствительность FE к поляризационному сопротивлению Rp (70% H₂O)')
-    ax2.legend(loc='lower left', title='Сопротивление Rp')
-    ax2.grid(True, axis='y', alpha=0.3)
-
-    return fig
-
-
-# ==============================================================================
-# 5. ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС STREAMLIT
-# ==============================================================================
-
-st.title("Моделирование электрохимического переноса в BZCYYb4411")
-st.markdown(
-    "Одномерная стационарная модель Нернста–Планка–Пуассона для протонного керамического "
-    "электролизера ($\mathrm{BaZr_{0.4}Ce_{0.4}Y_{0.1}Yb_{0.1}O_{3-\delta}}$) на базе быстрого "
-    "разреженного решателя Ньютона–Рафсона."
-)
-
-# Боковая панель параметров
-st.sidebar.header("Параметры эксперимента")
-
-uploaded_param = st.sidebar.file_uploader(
-    "Файл параметров (.mat)", type=["mat"],
-    help="Необязательно, если example_parameters_4411.mat лежит в папке репозитория или code/"
-)
-P_vec = load_mat_parameters(uploaded_param)
-
-if P_vec is None:
-    st.error(
-        "Файл `example_parameters_4411.mat` не найден в корне репозитория или папке `code/`. "
-        "Загрузите его через панель слева или добавьте в GitHub-репозиторий."
+with st.sidebar.expander("🔬 Режим решателя и границы", expanded=True):
+    solver_label = st.radio(
+        "Метод решения NPP",
+        ["Быстрый (алгебраический, постоянное поле)", "Точный (1D BVP, переменное поле)"],
+        index=0,
     )
-    st.stop()
+    solver_mode = "fast" if "Быстрый" in solver_label else "bvp"
+    use_arcsinh_shift = st.checkbox(
+        "Сдвиг граничных концентраций через Rp (arcsinh)",
+        value=True,
+        help="Учитывает влияние поляризации электродов на ток электронной утечки."
+    )
 
-icu = st.sidebar.slider("Плотность тока i (А/см²)", min_value=-2.5, max_value=0.0, value=-1.0, step=0.1)
-temp_c = st.sidebar.slider("Температура T (°C)", min_value=450, max_value=750, value=600, step=10)
-thick_um = st.sidebar.number_input("Толщина электролита L (мкм)", min_value=1.0, max_value=500.0, value=10.0, step=1.0)
-thick_m = thick_um * 1e-6
+with st.sidebar.expander("⚡ Режимные и геометрические параметры", expanded=True):
+    i_work = st.number_input("Плотность тока i [А/см²] (<0 PCEC, >0 PCFC)", -2.5, 2.5, -0.8, 0.05, format="%.2f")
+    T_work = st.slider("Температура T [°C]", 450, 750, 600, 5)
+    L_work = st.number_input("Толщина электролита L [мкм]", 1.0, 500.0, 10.0, 1.0)
+    c_R_work = st.slider("Концентрация допанта c_R [отн. ед.]", 0.10, 0.30, float(mat_params["default_cR"]), 0.01)
+    col_rp1, col_rp2 = st.columns(2)
+    Rp_H = col_rp1.number_input("Rp(H₂) [Ом·см²]", 0.0, 2.0, 0.05, 0.01, format="%.3f")
+    Rp_O = col_rp2.number_input("Rp(O₂) [Ом·см²]", 0.0, 2.0, 0.05, 0.01, format="%.3f")
 
-st.sidebar.subheader("Электроды и газовая среда")
-rp_h = st.sidebar.number_input("Rp водородного электрода (Ом·см²)", min_value=0.0, max_value=2.0, value=0.05, step=0.01)
-rp_o = st.sidebar.number_input("Rp кислородного электрода (Ом·см²)", min_value=0.0, max_value=2.0, value=0.05, step=0.01)
-ph_h2 = st.sidebar.slider("Доля H₂ (водородный электрод)", min_value=0.10, max_value=0.99, value=0.99, step=0.01)
-ph_h2o = st.sidebar.number_input("Доля H₂O (водородный электрод)", min_value=0.001, max_value=0.50, value=0.005, step=0.005, format="%.3f")
+with st.sidebar.expander("💨 Состав газов на электродах [атм]", expanded=True):
+    binary_fuel = st.checkbox("Двухкомпонентная смесь H₂/H₂O (p_H₂O = 1 - p_H₂)", value=True)
+    p_H2_f = st.slider("p(H₂) водородный электрод", 0.05, 0.995, 0.97, 0.01)
+    if binary_fuel:
+        p_H2O_f = max(1.0 - p_H2_f, 1e-4)
+        st.caption(f"p(H₂O) водородный = {p_H2O_f:.3f} атм")
+    else:
+        p_H2O_f = st.slider("p(H₂O) водородный электрод", 0.005, 0.50, 0.03, 0.005)
+    p_H2O_o = st.slider("p(H₂O) кислородный электрод (увлажнение воздуха)", 0.01, 0.95, 0.50, 0.01)
+    st.caption(f"p(O₂) кислородный = {0.21 * (1.0 - p_H2O_o):.4f} атм")
 
-st.sidebar.subheader("Настройки сетки и материала")
-cd_val = st.sidebar.number_input("Концентрация акцептора Cd", min_value=0.05, max_value=0.30, value=0.19, step=0.01)
-num_grid = st.sidebar.select_slider("Число узлов сетки", options=[100, 150, 200, 300], value=200)
+with st.sidebar.expander("🧪 Ручная правка параметров материала", expanded=False):
+    mat_params["dH_H2O"] = st.number_input("ΔH°(H₂O) [Дж/моль]", value=float(mat_params["dH_H2O"]), step=1000.0)
+    mat_params["dS_H2O"] = st.number_input("ΔS°(H₂O) [Дж/моль·К]", value=float(mat_params["dS_H2O"]), step=1.0)
+    mat_params["dH_O2"] = st.number_input("ΔH°(O₂) [Дж/моль]", value=float(mat_params["dH_O2"]), step=1000.0)
+    mat_params["dS_O2"] = st.number_input("ΔS°(O₂) [Дж/моль·К]", value=float(mat_params["dS_O2"]), step=1.0)
+    mat_params["E_p"] = st.number_input("E_act(OH•) [Дж/моль]", value=float(mat_params["E_p"]), step=500.0)
+    mat_params["E_h"] = st.number_input("E_act(O•) [Дж/моль]", value=float(mat_params["E_h"]), step=500.0)
 
-with st.sidebar.expander("Константы материала из .mat (вектор P)"):
-    param_names = ["Dp (м²/с)", "Dv (м²/с)", "Dh (м²/с)", "De (м²/с)", "Kp,H2O", "Kp,O2", "Kp,H2", "Keh"]
-    df_p = pd.DataFrame({"Параметр": param_names, "Значение": [f"{v:.4e}" for v in P_vec]})
-    st.dataframe(df_p, hide_index=True, use_container_width=True)
+with st.sidebar.expander("🎨 Настройка графиков (для статьи)", expanded=False):
+    fs_label = st.slider("Размер подписей осей", 8, 18, 11)
+    fs_tick = st.slider("Размер чисел на осях", 7, 16, 10)
+    fs_title = st.slider("Размер заголовка", 9, 20, 12)
+    fs_legend = st.slider("Размер легенды", 7, 16, 9)
+    lw = st.slider("Толщина линий", 1.0, 4.0, 2.0, 0.25)
+    show_markers = st.checkbox("Показывать маркеры на линиях", value=False)
+    ms = st.slider("Размер маркеров", 2, 10, 5)
+    show_grid = st.checkbox("Тонкая сетка", value=True)
+    cmap_multi = st.selectbox("Палитра для серий T", ["coolwarm", "viridis", "plasma", "turbo", "tab10"])
+    cmap_heat = st.selectbox("Палитра для тепловых карт", ["inferno", "viridis", "magma", "RdYlBu_r", "plasma"])
+    legend_title = st.text_input("Заголовок легенды (для серий T)", "Temperature")
+    legend_prefix = st.text_input("Формат подписи в легенде", "T = {T} °C")
 
-# Расчет трех режимов влажности (50%, 70%, 90% H2O)
-fractions = [0.50, 0.70, 0.90]
-oxygen_fractions = [0.2 * (1.0 - f) for f in fractions]
-P_tuple = tuple(float(x) for x in P_vec)
+# Применение стиля Matplotlib для научных публикаций
+plt.rcParams.update({
+    "font.size": fs_tick,
+    "axes.labelsize": fs_label,
+    "axes.labelweight": "bold",
+    "axes.titlesize": fs_title,
+    "axes.titleweight": "bold",
+    "axes.edgecolor": "black",
+    "axes.linewidth": 1.0,
+    "xtick.color": "black",
+    "ytick.color": "black",
+    "xtick.labelsize": fs_tick,
+    "ytick.labelsize": fs_tick,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "legend.fontsize": fs_legend,
+    "legend.frameon": True,
+    "legend.framealpha": 0.92,
+    "legend.edgecolor": "black",
+    "figure.dpi": 150,
+    "savefig.dpi": 600,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.1,
+})
 
-results = []
-t_start = time.perf_counter()
-try:
-    with st.spinner("Выполняется расчет стационарного переноса..."):
-        for frac, po2 in zip(fractions, oxygen_fractions):
-            res = solve_transport_steady(
-                icu=float(icu), Temp=float(temp_c), Thick=float(thick_m),
-                RpH=float(rp_h), RpH2O=float(rp_o),
-                Phh2o=float(ph_h2o), Phh2=float(ph_h2),
-                Psh2o=float(frac), Pso2=float(po2),
-                Cd=float(cd_val), P_tuple=P_tuple, num_grid=int(num_grid)
-            )
-            res['fraction'] = frac
-            results.append(res)
-except Exception as exc:
-    st.error(f"Ошибка численного решателя: {exc}")
-    st.stop()
-elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
-# Вкладки интерфейса
-tab1, tab2, tab3 = st.tabs([
-    "Сводка и верификация модели",
-    "Пространственные профили (6 графиков)",
-    "Данные ансамбля статьи (Boxplots)"
+def render_plot_with_download(fig, filename_base: str):
+    """Отображает график и кнопки скачивания PNG (600 DPI) и SVG."""
+    st.pyplot(fig, use_container_width=True)
+    c1, c2 = st.columns(2)
+    buf_png = io.BytesIO()
+    fig.savefig(buf_png, format="png", dpi=600)
+    c1.download_button("⬇️ PNG (600 DPI)", buf_png.getvalue(), f"{filename_base}.png", "image/png", key=f"png_{filename_base}")
+    buf_svg = io.BytesIO()
+    fig.savefig(buf_svg, format="svg")
+    c2.download_button("⬇️ SVG (вектор)", buf_svg.getvalue(), f"{filename_base}.svg", "image/svg+xml", key=f"svg_{filename_base}")
+    plt.close(fig)
+
+
+def style_ax(ax, xlabel, ylabel, title):
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    if show_grid:
+        ax.grid(True, linestyle="--", alpha=0.35, linewidth=0.6)
+
+
+# =============================================================================
+# 4. ЗАГОЛОВОК И КЛЮЧЕВЫЕ МЕТРИКИ В РАБОЧЕЙ ТОЧКЕ
+# =============================================================================
+st.title("⚡ Единая модель электро-, массо- и теплопереноса в мембране PCEC / PCFC")
+st.caption(f"Материал: **{preset_name}** | Решатель: **{solver_label}** | Носители: OH•, V••, O•")
+
+res_pt = solve_single_point(
+    i_work, T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
+    mat_params, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift
+)
+
+if solver_mode == "bvp" and not res_pt["bvp_converged"]:
+    st.warning("1D BVP решатель не сошёлся в данной точке (использовано алгебраическое приближение).")
+
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1.metric("Режим", res_pt["mode"].split()[0])
+m2.metric("V_cell [В]", f"{res_pt['V_cell']:.4f}", delta=f"E_eq = {res_pt['E_eq']:.3f} В")
+m3.metric("FE [%]", f"{res_pt['FE']:.2f}%")
+m4.metric("КПД (LHV) [%]", f"{res_pt['eff_LHV']:.2f}%")
+m5.metric("Тепло q̇ [Вт/см²]", f"{res_pt['q_dot']:.3f}", delta="Экзо" if res_pt["q_dot"] > 0 else "Эндо")
+m6.metric("Ток утечки i_h [А/см²]", f"{res_pt['i_h']:.4f}")
+
+# =============================================================================
+# 5. ВКЛАДКИ С ГРАФИКАМИ
+# =============================================================================
+tab1, tab2, tab3, tab4 = st.tabs([
+    "1. Профили по толщине (x/L)",
+    "2. ВАХ, токи и тепло (при T)",
+    "3. Мультитемпературный анализ",
+    "4. Тепловые карты (2D)"
 ])
 
+mk = "o" if show_markers else None
+
+# -----------------------------------------------------------------------------
+# ВКЛАДКА 1: 4 ПРОФИЛЯ ПО ТОЛЩИНЕ МЕМБРАНЫ
+# -----------------------------------------------------------------------------
 with tab1:
-    st.subheader(f"Ключевые показатели и диагностика (время расчета: {elapsed_ms:.0f} мс)")
-    cols = st.columns(3)
-    for col, r in zip(cols, results):
-        pct = int(round(r['fraction'] * 100))
-        with col:
-            st.metric(
-                label=f"Режим {pct}% H₂O | Фарадеевская эффективность",
-                value=f"{r['FE_mean']*100:.2f} %",
-                delta=f"Напряжение V = {r['V']:.3f} В"
-            )
+    st.subheader(f"Пространственные распределения по толщине мембраны (T = {T_work} °C, i = {i_work:.2f} А/см²)")
+    c1, c2 = st.columns(2)
+    x = res_pt["x_norm"]
 
-    summary_rows = []
-    for r in results:
-        summary_rows.append({
-            "Доля пара H₂O (%)": int(round(r['fraction'] * 100)),
-            "FE среднее (%)": round(r['FE_mean'] * 100, 4),
-            "Разброс FE std (%)": f"{r['FE_std'] * 100:.2e}",
-            "Напряжение ячейки V (В)": round(r['V'], 4),
-            "Ошибка сохранения тока ε_i": f"{r['current_conservation_err']:.2e}",
-            "Макс. невязка решателя": f"{r['max_residual']:.2e}",
-            "Итераций Ньютона": r['newton_iters']
-        })
-    st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+    with c1:
+        # График 1: Концентрации дефектов
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(x, res_pt["cp"], lw=lw, marker=mk, ms=ms, label=r"$[\mathrm{OH_O^\bullet}]_L$ (протоны)")
+        ax.plot(x, res_pt["cv"], lw=lw, marker=mk, ms=ms, label=r"$[\mathrm{V_O^{\bullet\bullet}}]_L$ (вакансии)")
+        ax.plot(x, res_pt["ch"], lw=lw, marker=mk, ms=ms, label=r"$[\mathrm{O_O^\bullet}]_L$ (поляроны)")
+        ax.set_yscale("log")
+        style_ax(ax, r"Безразмерная координата $x / L$", "Концентрация на форм. ед. (log)", "1. Профили концентраций дефектов")
+        ax.legend()
+        render_plot_with_download(fig, "01_defect_profiles")
 
-    st.info(
-        "**Проверка физической состоятельности:** Относительная ошибка сохранения полного тока "
-        "$\varepsilon_i = \max |i_{\text{total}}(x) - i_{\text{target}}| / |i_{\text{target}}|$ и разброс FE "
-        "по толщине вычисляются автоматически по всем внутренним граням сетки."
-    )
+        # График 3: Парциальные проводимости
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(x, res_pt["sig_p"] * 1e3, lw=lw, label=r"$\sigma_p$ (протоны)")
+        ax.plot(x, res_pt["sig_h"] * 1e3, lw=lw, label=r"$\sigma_h$ (поляроны)")
+        ax.plot(x, res_pt["sig_v"] * 1e3, lw=lw, label=r"$\sigma_v$ (вакансии)")
+        ax.plot(x, res_pt["sig_tot"] * 1e3, lw=lw, ls="--", color="black", label=r"$\sigma_{\mathrm{tot}}$")
+        style_ax(ax, r"Безразмерная координата $x / L$", r"Проводимость [мСм/см]", "3. Парциальные проводимости")
+        ax.legend()
+        render_plot_with_download(fig, "03_conductivities")
 
-    # Экспорт результатов в CSV
-    export_dfs = []
-    for r in results:
-        pct = int(round(r['fraction'] * 100))
-        df_case = pd.DataFrame({
-            'H2O_pct': pct,
-            'x_L': r['x_nodes'],
-            'Ce_mol_m3': r['Ce'],
-            'Ch_mol_m3': r['Ch'],
-            'Cp_mol_m3': r['Cp'],
-            'Cv_mol_m3': r['Cv'],
-            'Co_mol_m3': r['Co'],
-            'Phi_V': r['Phi'],
-            'pO2_atm': r['pO2'],
-            'pH2_atm': r['pH2'],
-            'pH2O_atm': r['pH2O']
-        })
-        export_dfs.append(df_case)
-    csv_buffer = pd.concat(export_dfs, ignore_index=True).to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="Скачать рассчитанные профили (CSV)",
-        data=csv_buffer,
-        file_name=f"BZCYYb4411_T{temp_c}_i{abs(icu):.1f}.csv",
-        mime="text/csv"
-    )
+    with c2:
+        # График 2: Потенциал и электрическое поле
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(x, res_pt["Phi"], lw=lw, color="tab:blue", label=r"Потенциал $\Phi(x)$")
+        style_ax(ax, r"Безразмерная координата $x / L$", r"Потенциал $\Phi$ [В]", "2. Электростатический потенциал и поле")
+        ax2 = ax.twinx()
+        ax2.plot(x, res_pt["E_field"] * 1e-5, lw=lw, ls="--", color="tab:red", label=r"Поле $E(x)$")
+        ax2.set_ylabel(r"Напряжённость поля $E$ [$10^5$ В/м]", color="tab:red")
+        ax2.tick_params(axis="y", labelcolor="tab:red", direction="in")
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, loc="best")
+        render_plot_with_download(fig, "02_potential_field")
 
+        # График 4: Внутренние парциальные давления газов
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(x, np.log10(np.maximum(res_pt["p_O2_int"], 1e-35)), lw=lw, label=r"$\log_{10} p_{\mathrm{O_2}}$")
+        ax.plot(x, np.log10(np.maximum(res_pt["p_H2O_int"], 1e-35)), lw=lw, label=r"$\log_{10} p_{\mathrm{H_2O}}$")
+        ax.plot(x, np.log10(np.maximum(res_pt["p_H2_int"], 1e-35)), lw=lw, label=r"$\log_{10} p_{\mathrm{H_2}}$")
+        ax.axhline(0.0, color="gray", ls=":", lw=1.0, label="1 атм (порог)")
+        style_ax(ax, r"Безразмерная координата $x / L$", r"$\log_{10}(p_i / \mathrm{атм})$", "4. Внутренние парциальные давления")
+        ax.legend()
+        render_plot_with_download(fig, "04_internal_pressures")
+
+# -----------------------------------------------------------------------------
+# ВКЛАДКА 2: РАЗВЁРТКА ПО ТОКУ (PCEC -> OCV -> PCFC) ПРИ T_work
+# -----------------------------------------------------------------------------
 with tab2:
-    st.subheader("Пространственные распределения носителей, токов, потенциала и давлений")
-    fig_profiles = make_profiles_figure(results)
-    st.pyplot(fig_profiles)
+    st.subheader(f"Вольт-амперные и энергетические характеристики при T = {T_work} °C")
+    col_i1, col_i2, col_i3 = st.columns(3)
+    i_min = col_i1.number_input("Мин. ток (PCEC) [А/см²]", -3.0, -0.1, -1.5, 0.1)
+    i_max = col_i2.number_input("Макс. ток (PCFC) [А/см²]", 0.1, 3.0, 1.0, 0.1)
+    n_pts = col_i3.slider("Число точек развёртки", 20, 80, 41)
 
-    img_buf = io.BytesIO()
-    fig_profiles.savefig(img_buf, format='png', dpi=200, bbox_inches='tight')
-    st.download_button(
-        label="Скачать графики профилей (PNG)",
-        data=img_buf.getvalue(),
-        file_name=f"profiles_BZCYYb4411_T{temp_c}.png",
-        mime="image/png"
-    )
-
-with tab3:
-    st.subheader("Распределения FE по ансамблю параметров (figure_summary_4411.mat)")
-    summary_mat = load_summary_data()
-    if summary_mat is not None:
-        fig_sum = make_summary_figure(summary_mat)
-        st.pyplot(fig_sum)
-    else:
-        st.warning(
-            "Файл `figure_summary_4411.mat` не найден в репозитории (ожидается в корне или в папке `figure_data/`)."
+    i_grid = np.linspace(i_min, i_max, n_pts)
+    sweep_rows = []
+    for iv in i_grid:
+        # Для быстрой развёртки используем выбранный решатель
+        r = solve_single_point(
+            float(iv), T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
+            mat_params, solver_mode=solver_mode, use_arcsinh_shift=use_arcsinh_shift, n_grid=40
         )
+        sweep_rows.append({k: r[k] for k in [
+            "i", "V_cell", "E_eq", "dPhi", "eta_H", "eta_O",
+            "i_p", "i_v", "i_h", "t_p", "t_v", "t_h",
+            "FE", "eff_LHV", "P_elec", "q_dot", "V_TN_theo", "V_TN_act"
+        ]})
+    df_i = pd.DataFrame(sweep_rows)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        # График 5: ВАХ и мощность PCFC
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(df_i["i"], df_i["V_cell"], lw=lw, marker=mk, ms=ms, color="navy", label=r"$V_{\mathrm{cell}}$")
+        ax.axvline(0.0, color="black", ls=":", lw=1.0)
+        style_ax(ax, r"Плотность тока $i$ [А/см²]", r"Напряжение $V_{\mathrm{cell}}$ [В]", "5. ВАХ (PCEC / PCFC) и мощность")
+        ax2 = ax.twinx()
+        df_fc = df_i[df_i["i"] >= 0]
+        ax2.plot(df_fc["i"], df_fc["P_elec"], lw=lw, ls="--", color="crimson", label="Мощность PCFC")
+        ax2.set_ylabel(r"Удельная мощность $P$ [Вт/см²]", color="crimson")
+        ax2.tick_params(axis="y", labelcolor="crimson", direction="in")
+        l1, lb1 = ax.get_legend_handles_labels()
+        l2, lb2 = ax2.get_legend_handles_labels()
+        ax.legend(l1 + l2, lb1 + lb2, loc="best")
+        render_plot_with_download(fig, "05_IV_power")
+
+        # График 7: Парциальные плотности токов
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(df_i["i"], df_i["i_p"], lw=lw, label=r"$i_p$ (протоны)")
+        ax.plot(df_i["i"], df_i["i_h"], lw=lw, label=r"$i_h$ (поляроны / утечка)")
+        ax.plot(df_i["i"], df_i["i_v"], lw=lw, label=r"$i_v$ (вакансии)")
+        ax.axhline(0, color="black", ls=":", lw=0.8)
+        ax.axvline(0, color="black", ls=":", lw=0.8)
+        style_ax(ax, r"Полный ток $i$ [А/см²]", r"Парциальный ток $i_k$ [А/см²]", "7. Парциальные плотности токов")
+        ax.legend()
+        render_plot_with_download(fig, "07_partial_currents")
+
+        # График 9: Тепловой баланс и термонейтральное напряжение
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(df_i["i"], df_i["q_dot"], lw=lw, color="darkorange", label=r"Тепловыделение $\dot{q}$")
+        ax.axhline(0.0, color="black", ls="--", lw=1.0, label="Термонейтраль ($\dot{q}=0$)")
+        ax.fill_between(df_i["i"], df_i["q_dot"], 0, where=(df_i["q_dot"] > 0), color="red", alpha=0.12)
+        ax.fill_between(df_i["i"], df_i["q_dot"], 0, where=(df_i["q_dot"] < 0), color="blue", alpha=0.12)
+        style_ax(ax, r"Плотность тока $i$ [А/см²]", r"Удельный тепловой поток $\dot{q}$ [Вт/см²]", "9. Тепловой баланс (эндо / экзо)")
+        ax.legend()
+        render_plot_with_download(fig, "09_heat_balance")
+
+    with c2:
+        # График 6: Разложение потерь напряжения
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(df_i["i"], df_i["dPhi"], lw=lw, label=r"Мембрана $\Delta\Phi$")
+        ax.plot(df_i["i"], -df_i["eta_H"], lw=lw, label=r"Поляризация $-\eta_{\mathrm{H_2}}$")
+        ax.plot(df_i["i"], -df_i["eta_O"], lw=lw, ls="--", label=r"Поляризация $-\eta_{\mathrm{O_2}}$")
+        ax.axhline(0, color="black", ls=":", lw=0.8)
+        style_ax(ax, r"Плотность тока $i$ [А/см²]", r"Составляющие напряжения [В]", "6. Разложение омических и электродных потерь")
+        ax.legend()
+        render_plot_with_download(fig, "06_voltage_losses")
+
+        # График 8: Числа переноса и Фарадеевская эффективность
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        df_ec = df_i[df_i["i"] < -0.05]
+        df_fc = df_i[df_i["i"] > 0.05]
+        ax.plot(df_ec["i"], np.clip(df_ec["FE"], 0, 105), lw=lw, color="tab:blue", label="FE (PCEC)")
+        ax.plot(df_fc["i"], np.clip(df_fc["FE"], 0, 105), lw=lw, color="tab:green", label="FE (PCFC)")
+        ax.plot(df_i["i"], df_i["t_p"] * 100.0, lw=lw, ls="--", color="black", label=r"$t_p$ (среднее)")
+        ax.set_ylim(0, 105)
+        style_ax(ax, r"Плотность тока $i$ [А/см²]", "Эффективность / число переноса [%]", "8. Фарадеевская эффективность и t_p")
+        ax.legend()
+        render_plot_with_download(fig, "08_FE_transport")
+
+        # График 10: Энергетический КПД по LHV
+        fig, ax = plt.subplots(figsize=(6, 4.2))
+        ax.plot(df_ec["i"], np.clip(df_ec["eff_LHV"], 0, 105), lw=lw, color="teal", label="КПД PCEC (LHV)")
+        ax.plot(df_fc["i"], np.clip(df_fc["eff_LHV"], 0, 105), lw=lw, color="purple", label="КПД PCFC (LHV)")
+        ax.set_ylim(0, 105)
+        style_ax(ax, r"Плотность тока $i$ [А/см²]", "Энергетический КПД (LHV) [%]", "10. Энергетический КПД по LHV")
+        ax.legend()
+        render_plot_with_download(fig, "10_energy_efficiency")
+
+    st.download_button("📥 Скачать таблицу развёртки по току (CSV)", df_i.to_csv(index=False).encode("utf-8"), "iv_sweep.csv", "text/csv")
+
+# -----------------------------------------------------------------------------
+# ВКЛАДКА 3: МУЛЬТИТЕМПЕРАТУРНЫЙ АНАЛИЗ
+# -----------------------------------------------------------------------------
+with tab3:
+    st.subheader("Динамика характеристик при различных температурах")
+    default_temps = [500, 550, 600, 650, 700]
+    selected_temps = st.multiselect(
+        "Выберите температуры для анализа [°C]",
+        options=list(range(450, 755, 25)),
+        default=default_temps,
+    )
+    selected_temps = sorted(selected_temps)
+
+    if len(selected_temps) < 2:
+        st.info("Выберите хотя бы 2 температуры для построения сравнительных графиков.")
+    else:
+        cmap = cm.get_cmap(cmap_multi)
+        colors = [cmap(k / max(len(selected_temps) - 1, 1)) for k in range(len(selected_temps))]
+
+        i_multi = np.linspace(i_min, i_max, 35)
+        multi_iv = {}
+        t_summary = []
+
+        for T_val in selected_temps:
+            rows_T = []
+            for iv in i_multi:
+                r = solve_single_point(
+                    float(iv), T_val, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work,
+                    mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=25
+                )
+                rows_T.append(r)
+            multi_iv[T_val] = pd.DataFrame(rows_T)
+
+            # Точка OCV и рабочая точка i_work
+            r_ocv = solve_single_point(0.0, T_val, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=25)
+            r_wk = solve_single_point(i_work, T_val, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=25)
+            t_summary.append({
+                "T_C": T_val, "E_eq": r_ocv["E_eq"], "OCV": r_ocv["V_cell"],
+                "RdOCV_mV": (r_ocv["E_eq"] - r_ocv["V_cell"]) * 1e3,
+                "i_leak_OCV": abs(r_ocv["i_h"]), "t_p_wk": r_wk["t_p"] * 100.0,
+                "FE_wk": r_wk["FE"], "eff_wk": r_wk["eff_LHV"],
+                "q_dot_wk": r_wk["q_dot"], "V_TN_act": r_wk["V_TN_act"], "V_TN_theo": r_wk["V_TN_theo"]
+            })
+        df_T = pd.DataFrame(t_summary)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            # График 11: Семейство ВАХ
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            for idx, T_val in enumerate(selected_temps):
+                df_t = multi_iv[T_val]
+                lbl = legend_prefix.replace("{T}", str(T_val))
+                ax.plot(df_t["i"], df_t["V_cell"], lw=lw, marker=mk, ms=ms, color=colors[idx], label=lbl)
+            ax.axvline(0, color="black", ls=":", lw=0.8)
+            style_ax(ax, r"Плотность тока $i$ [А/см²]", r"Напряжение $V_{\mathrm{cell}}$ [В]", "11. Семейство ВАХ при разных T")
+            ax.legend(title=legend_title)
+            render_plot_with_download(fig, "11_multiT_IV")
+
+            # График 13: OCV, E_eq и потери RdOCV(T)
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            ax.plot(df_T["T_C"], df_T["E_eq"], lw=lw, marker="o", ms=ms, label=r"$E_{\mathrm{eq}}$")
+            ax.plot(df_T["T_C"], df_T["OCV"], lw=lw, marker="s", ms=ms, label="OCV")
+            style_ax(ax, "Температура T [°C]", "Потенциал [В]", "13. E_eq, OCV и потери RdOCV от T")
+            ax2 = ax.twinx()
+            ax2.plot(df_T["T_C"], df_T["RdOCV_mV"], lw=lw, ls="--", marker="^", ms=ms, color="crimson", label="RdOCV [мВ]")
+            ax2.set_ylabel("Снижение OCV (RdOCV) [мВ]", color="crimson")
+            ax2.tick_params(axis="y", labelcolor="crimson", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            ax.legend(l1 + l2, lb1 + lb2, loc="best")
+            render_plot_with_download(fig, "13_multiT_OCV")
+
+        with c2:
+            # График 12: Семейство FE(i, T)
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            for idx, T_val in enumerate(selected_temps):
+                df_t = multi_iv[T_val]
+                lbl = legend_prefix.replace("{T}", str(T_val))
+                df_ec_t = df_t[df_t["i"] < -0.05]
+                df_fc_t = df_t[df_t["i"] > 0.05]
+                ax.plot(df_ec_t["i"], np.clip(df_ec_t["FE"], 0, 105), lw=lw, color=colors[idx], label=lbl)
+                ax.plot(df_fc_t["i"], np.clip(df_fc_t["FE"], 0, 105), lw=lw, ls="--", color=colors[idx])
+            ax.set_ylim(0, 105)
+            style_ax(ax, r"Плотность тока $i$ [А/см²]", "Фарадеевская эффективность FE [%]", "12. Семейство FE(i) при разных T")
+            ax.legend(title=legend_title)
+            render_plot_with_download(fig, "12_multiT_FE")
+
+            # График 14: Тепловыделение, V_TN_act и КПД от T
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            ax.plot(df_T["T_C"], df_T["FE_wk"], lw=lw, marker="o", ms=ms, label="FE [%]")
+            ax.plot(df_T["T_C"], df_T["eff_wk"], lw=lw, marker="s", ms=ms, label="КПД LHV [%]")
+            style_ax(ax, "Температура T [°C]", "Эффективность [%]", f"14. Динамика FE, КПД и q̇ (i={i_work:.2f} А/см²)")
+            ax2 = ax.twinx()
+            ax2.plot(df_T["T_C"], df_T["q_dot_wk"], lw=lw, ls="--", marker="^", ms=ms, color="darkorange", label=r"$\dot{q}$ [Вт/см²]")
+            ax2.set_ylabel(r"Тепловыделение $\dot{q}$ [Вт/см²]", color="darkorange")
+            ax2.tick_params(axis="y", labelcolor="darkorange", direction="in")
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = ax2.get_legend_handles_labels()
+            ax.legend(l1 + l2, lb1 + lb2, loc="best")
+            render_plot_with_download(fig, "14_multiT_thermal_eff")
+
+        st.download_button("📥 Скачать сводную таблицу по температурам (CSV)", df_T.to_csv(index=False).encode("utf-8"), "multiT_summary.csv", "text/csv")
+
+# -----------------------------------------------------------------------------
+# ВКЛАДКА 4: ТЕПЛОВЫЕ КАРТЫ (2D CONTOURF / HEATMAPS)
+# -----------------------------------------------------------------------------
+with tab4:
+    st.subheader("2D Тепловые карты (параметрические карты с изолиниями)")
+    res_hm = st.slider("Разрешение сетки тепловых карт (N × N)", 12, 35, 20)
+
+    T_hm = np.linspace(480, 700, res_hm)
+    i_hm_ec = np.linspace(-1.8, -0.1, res_hm)
+    L_hm = np.linspace(3.0, 50.0, res_hm)
+
+    FE_map = np.zeros((res_hm, res_hm))
+    Q_map = np.zeros((res_hm, res_hm))
+    Eff_L_map = np.zeros((res_hm, res_hm))
+    pO2_map = np.zeros((res_hm, res_hm))
+
+    for idx_t, tv in enumerate(T_hm):
+        for idx_i, iv in enumerate(i_hm_ec):
+            r = solve_single_point(float(iv), float(tv), L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=15)
+            FE_map[idx_t, idx_i] = np.clip(r["FE"], 0, 100)
+            Q_map[idx_t, idx_i] = r["q_dot"]
+
+    for idx_l, lv in enumerate(L_hm):
+        for idx_i, iv in enumerate(i_hm_ec):
+            r = solve_single_point(float(iv), T_work, float(lv), Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=15)
+            Eff_L_map[idx_l, idx_i] = np.clip(r["eff_LHV"], 0, 100)
+
+    x_hm = np.linspace(0.0, 1.0, res_hm)
+    for idx_i, iv in enumerate(i_hm_ec):
+        r = solve_single_point(float(iv), T_work, L_work, Rp_H, Rp_O, p_H2_f, p_H2O_f, p_H2O_o, c_R_work, mat_params, solver_mode="fast", use_arcsinh_shift=use_arcsinh_shift, n_grid=res_hm)
+        pO2_map[:, idx_i] = np.log10(np.maximum(r["p_O2_int"], 1e-30))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        # График 15: Тепловая карта FE(T, i)
+        fig, ax = plt.subplots(figsize=(6, 4.4))
+        cf = ax.contourf(i_hm_ec, T_hm, FE_map, levels=20, cmap=cmap_heat)
+        cs = ax.contour(i_hm_ec, T_hm, FE_map, levels=8, colors="white", linewidths=0.7, alpha=0.8)
+        ax.clabel(cs, inline=True, fontsize=fs_tick - 1, fmt="%.0f%%")
+        fig.colorbar(cf, ax=ax, label="FE [%]")
+        style_ax(ax, r"Плотность тока PCEC $i$ [А/см²]", "Температура T [°C]", "15. Карта Фарадеевской эффективности FE(T, i)")
+        render_plot_with_download(fig, "15_heatmap_FE_Ti")
+
+        # График 17: Тепловая карта КПД(L, i) — выбор оптимальной толщины
+        fig, ax = plt.subplots(figsize=(6, 4.4))
+        cf = ax.contourf(i_hm_ec, L_hm, Eff_L_map, levels=20, cmap=cmap_heat)
+        cs = ax.contour(i_hm_ec, L_hm, Eff_L_map, levels=8, colors="white", linewidths=0.7, alpha=0.8)
+        ax.clabel(cs, inline=True, fontsize=fs_tick - 1, fmt="%.0f%%")
+        fig.colorbar(cf, ax=ax, label="КПД LHV [%]")
+        style_ax(ax, r"Плотность тока PCEC $i$ [А/см²]", r"Толщина электролита $L$ [мкм]", f"17. Оптимум толщины: КПД(L, i) при {T_work} °C")
+        render_plot_with_download(fig, "17_heatmap_Eff_Li")
+
+    with c2:
+        # График 16: Тепловая карта теплового баланса q_dot(T, i)
+        fig, ax = plt.subplots(figsize=(6, 4.4))
+        vmax = max(abs(Q_map.min()), abs(Q_map.max()), 0.1)
+        cf = ax.contourf(i_hm_ec, T_hm, Q_map, levels=20, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        cs0 = ax.contour(i_hm_ec, T_hm, Q_map, levels=[0.0], colors="black", linewidths=2.0)
+        ax.clabel(cs0, inline=True, fontsize=fs_tick, fmt="q̇=0 (TN)")
+        fig.colorbar(cf, ax=ax, label=r"Тепловой поток $\dot{q}$ [Вт/см²]")
+        style_ax(ax, r"Плотность тока PCEC $i$ [А/см²]", "Температура T [°C]", "16. Тепловая карта q̇(T, i) и линия термонейтрали")
+        render_plot_with_download(fig, "16_heatmap_Q_Ti")
+
+        # График 18: Тепловая карта внутреннего давления O2(x/L, i)
+        fig, ax = plt.subplots(figsize=(6, 4.4))
+        cf = ax.contourf(i_hm_ec, x_hm, pO2_map, levels=20, cmap=cmap_heat)
+        cs = ax.contour(i_hm_ec, x_hm, pO2_map, levels=6, colors="white", linewidths=0.7, alpha=0.8)
+        ax.clabel(cs, inline=True, fontsize=fs_tick - 1, fmt="%.1f")
+        fig.colorbar(cf, ax=ax, label=r"$\log_{10}(p_{\mathrm{O_2}} / \mathrm{атм})$")
+        style_ax(ax, r"Плотность тока PCEC $i$ [А/см²]", r"Координата в мембране $x / L$", f"18. Карта внутреннего давления O₂ ({T_work} °C)")
+        render_plot_with_download(fig, "18_heatmap_pO2_xi")
