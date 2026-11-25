@@ -1131,8 +1131,12 @@ def style_legend(ax, title=None, loc="best", handles=None, labels=None):
                 text.set_color(handle.get_color())
             elif hasattr(handle, "get_facecolor"):
                 fc = handle.get_facecolor()
-                if len(fc) > 0:
+                if isinstance(fc, tuple):
+                    text.set_color(fc)
+                elif hasattr(fc, "ndim") and fc.ndim == 2 and len(fc) > 0:
                     text.set_color(fc[0])
+                elif hasattr(fc, "ndim") and fc.ndim == 1 and len(fc) in (3, 4):
+                    text.set_color(fc)
     return leg
 
 
