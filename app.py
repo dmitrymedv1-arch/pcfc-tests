@@ -1961,208 +1961,82 @@ with tab5:
 # -----------------------------------------------------------------------------
 # TAB 6: NOVEL RESEARCH INSIGHTS & MATERIAL DESIGN
 # -----------------------------------------------------------------------------
+        
 with tab6:
-        st.subheader("Export Results")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**Export Peak Data** *(for Complete Dataset table)*")
-            
-            # Create peaks DataFrame with Fmax and C columns
-            peaks_data = []
-            for p in deconv_result.peaks:
-                char = calculate_peak_characteristics(p)
-                peaks_data.append({
-                    'Peak_ID': p.id,
-                    'Center_tau_s': p.center,
-                    'Center_log_tau': p.center_log,
-                    'Fmax_Hz': char['fmax_hz'],
-                    'C_Farad': char['c_farad'],
-                    'Amplitude_Ohm': p.amplitude,
-                    'Amplitude_Normalized': p.amplitude_norm,
-                    'Sigma_log': p.sigma_log,
-                    'FWHM': p.fwhm,
-                    'Area_Ohm_s': p.area,
-                    'Fraction': p.fraction,
-                    'Fraction_Percent': p.fraction_percent,
-                    'Source': p.source,
-                    'Characteristic_Frequency_Hz': p.get_characteristic_frequency(),
-                    'Resistance_Contribution_Ohm': p.get_resistance_contribution()
-                })
-            
-            peaks_df = pd.DataFrame(peaks_data)
-            csv_peaks = peaks_df.to_csv(index=False)
-            st.download_button(
-                "📥 Export Peaks as CSV",
-                data=csv_peaks,
-                file_name=f"deconvolution_peaks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-            
-            st.markdown("**Export Fitting Data** *(from Gaussian Deconvolution Result)*")
-            
-            if deconv_result.fit_y_original is not None:
-                fit_values = deconv_result.fit_y_original
-            else:
-                fit_values = np.zeros_like(deconv_result.x_linear)
-                for i, tau in enumerate(deconv_result.x_linear):
-                    if deconv_result.use_log_x:
-                        log_tau = np.log10(tau)
-                    else:
-                        log_tau = tau
-                    
-                    total = 0
-                    for peak in deconv_result.peaks:
-                        total += peak.amplitude * GaussianModelDeconv.gaussian(
-                            log_tau, 1.0, peak.center_log, peak.sigma_log
-                        )
-                    
-                    if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
-                        if deconv_result.baseline_method == 'constant':
-                            total += deconv_result.baseline_params[0]
-                        elif deconv_result.baseline_method == 'linear':
-                            total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
-                        elif deconv_result.baseline_method == 'quadratic':
-                            total += (deconv_result.baseline_params[0] + 
-                                     deconv_result.baseline_params[1] * log_tau +
-                                     deconv_result.baseline_params[2] * log_tau**2)
-                    
-                    fit_values[i] = total
-            
-            residuals = deconv_result.y_original - fit_values
-            
-            fit_data = pd.DataFrame({
-                'tau_s': deconv_result.x_linear,
-                'gamma_tau_Ohm': deconv_result.y_original,
-                'gamma_fit_Ohm': fit_values,
-                'Residuals_Ohm': residuals
-            })
-            
-            csv_fit = fit_data.to_csv(index=False)
-            st.download_button(
-                "📥 Export Fitting Data as CSV",
-                data=csv_fit,
-                file_name=f"deconvolution_fit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+    st.subheader("Novel Multiphysics Insights, Safe Operating Window & Material Design")
+    nov_c1, nov_c2, nov_c3 = st.columns(3)
+    fe_min_sow = nov_c1.slider("SOW Min Faradaic Eff. (%)", 50, 95, 80)
+    q_max_sow = nov_c2.number_input("SOW Max |q̇| (W cm⁻²)", 0.1, 2.0, 0.5, 0.1)
+    nov_3d = nov_c3.checkbox("Render Novel Maps in 3D", value=False)
 
-            # --- Export Normalized Gaussian Deconvolution Result ---
-            st.markdown("**Export Normalized Deconvolution Data** *(Normalized spectrum + Total Fit + Peaks)*")
-            
-            peaks_sorted_exp = sorted(deconv_result.peaks, key=lambda p: p.id)
-            max_amp_exp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
-            x_eval = np.log10(np.maximum(deconv_result.x_linear, 1e-15)) if deconv_result.use_log_x else deconv_result.x_linear
-            
-            norm_dict = {
-                'tau_s': deconv_result.x_linear,
-                'gamma_tau_norm': deconv_result.y_original / max_amp_exp,
-                'Total_Fit_norm': fit_values / max_amp_exp
-            }
-            for peak in peaks_sorted_exp:
-                y_comp_norm = (peak.amplitude * GaussianModelDeconv.gaussian(
-                    x_eval, 1.0, peak.center_log, peak.sigma_log
-                )) / max_amp_exp
-                norm_dict[f'Peak_{peak.id}_norm'] = y_comp_norm
-            
-            csv_norm = pd.DataFrame(norm_dict).to_csv(index=False)
-            st.download_button(
-                "📥 Export Normalized Deconvolution as CSV",
-                data=csv_norm,
-                file_name=f"deconvolution_normalized_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+    (
+        T_inst, V_inst, hmin_map,
+        i_ec_rt, i_fc_rt, RT_map,
+        x_wf, chem_wf, df_sens, df_radar
+    ) = cached_novel_insights(
+        float(T_work), float(L_work), float(Rp_H), float(Rp_O),
+        float(p_H2_f), float(p_H2O_f), float(p_H2O_o), float(c_R_work),
+        mat_tuple, use_arcsinh_shift, use_trapping, use_dgm
+    )
 
-            # --- Export 2.2 Gaussian Deconvolution vs Frequency ---
-            st.markdown("**Export 2.2 Deconvolution vs Frequency** *(Spectrum + Total Fit + Peaks)*")
-            
-            freqs_deconv = 1.0 / (2.0 * np.pi * deconv_result.x_linear)
-            sort_idx_f = np.argsort(freqs_deconv)[::-1]  # high to low, as on Graph 2.2
-            log_tau_f = np.log10(np.maximum(deconv_result.x_linear[sort_idx_f], 1e-15))
-            
-            freq_deconv_dict = {
-                'Frequency_Hz': freqs_deconv[sort_idx_f],
-                'gamma_tau_Ohm': deconv_result.y_original[sort_idx_f],
-                'Total_Fit_Ohm': fit_values[sort_idx_f]
-            }
-            for peak in peaks_sorted_exp:
-                y_comp_f = peak.amplitude * GaussianModelDeconv.gaussian(
-                    log_tau_f, 1.0, peak.center_log, peak.sigma_log
-                )
-                freq_deconv_dict[f'Peak_{peak.id}_Ohm'] = y_comp_f
-            
-            csv_freq_deconv = pd.DataFrame(freq_deconv_dict).to_csv(index=False)
-            st.download_button(
-                "📥 Export 2.2 Deconvolution vs Frequency as CSV",
-                data=csv_freq_deconv,
-                file_name=f"deconvolution_vs_freq_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+    c1, c2 = st.columns(2)
+    with c1:
+        # 1. Safe Operating Window (SOW) Phase Map in (T, i)
+        fig, ax = plt.subplots(figsize=(6.2, 4.5))
+        X_s, Y_s = np.meshgrid(i_hm_ec, T_hm)
+        safe_mask = (FE_map >= fe_min_sow) & (pO2_max_map <= pO2_crit_atm) & (np.abs(Q_map) <= q_max_sow)
+        cf_sow = ax.contourf(X_s, Y_s, FE_map, levels=20, cmap="YlGn", alpha=0.55)
+        ax.contourf(X_s, Y_s, (~safe_mask).astype(float), levels=[0.5, 1.5], colors=["#ffcccc"], hatches=["///"], alpha=0.45)
+        ax.contour(X_s, Y_s, FE_map, levels=[fe_min_sow], colors=["navy"], linewidths=2.0)
+        ax.contour(X_s, Y_s, pO2_max_map, levels=[pO2_crit_atm], colors=["crimson"], linewidths=2.0, linestyles="--")
+        ax.contour(X_s, Y_s, np.abs(Q_map), levels=[q_max_sow], colors=["darkorange"], linewidths=1.8, linestyles="-.")
+        ax.contour(X_s, Y_s, Q_map, levels=[0.0], colors=["black"], linewidths=1.4, linestyles=":")
+        fig.colorbar(cf_sow, ax=ax, label="Faradaic Efficiency (%)")
+        ax.plot([], [], color="navy", lw=2.0, label=f"FE = {fe_min_sow}%")
+        ax.plot([], [], color="crimson", lw=2.0, ls="--", label=f"max p(O₂) = {pO2_crit_atm} atm")
+        ax.plot([], [], color="darkorange", lw=1.8, ls="-.", label=f"|q̇| = {q_max_sow} W cm⁻²")
+        ax.plot([], [], color="black", lw=1.4, ls=":", label="q̇ = 0 (TN)")
+        style_ax(ax, r"PCEC Current Density (A cm$^{-2}$)", "Temperature (°C)", "Safe Operating Window (SOW) Phase Map")
+        ax.legend(loc="lower left", fontsize=fs_legend - 1)
+        render_plot_with_download(fig, "novel_SOW_phase_map")
 
-            # --- Export 2.4 Experimental vs Sequential RQ (ZARC) Model ---
-            if data is not None and drt_result is not None:
-                st.markdown("**Export 2.4 Sequential RQ (ZARC) Model** *(Experimental + Total Model + Processes)*")
-                
-                sort_idx_exp = np.argsort(data.freq)
-                freq_exp_s = data.freq[sort_idx_exp]
-                re_exp_s = data.re_z[sort_idx_exp]
-                im_exp_s = data.im_z[sort_idx_exp]
-                omega_exp_s = 2.0 * np.pi * freq_exp_s
-                
-                R_inf_start = drt_result.R_inf
-                for i in range(len(im_exp_s) - 1):
-                    if im_exp_s[i] >= 0 and im_exp_s[i + 1] < 0:
-                        t = -im_exp_s[i] / (im_exp_s[i + 1] - im_exp_s[i])
-                        R_inf_start = float(re_exp_s[i] + t * (re_exp_s[i + 1] - re_exp_s[i]))
-                        break
-                
-                Z_total_exp = np.full_like(omega_exp_s, R_inf_start, dtype=complex)
-                if drt_result.L > 0:
-                    Z_total_exp += 1j * omega_exp_s * drt_result.L
-                
-                process_cols = {}
-                cumulative_R = R_inf_start
-                for peak in peaks_sorted_exp:
-                    sigma = max(float(peak.sigma_log), 1e-6)
-                    center_log = float(peak.center_log)
-                    if sigma < 1e-4:
-                        Z_i = peak.area / (1.0 + 1j * omega_exp_s * peak.center)
-                    else:
-                        u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
-                        tau_sub = 10.0 ** u_grid
-                        gauss_profile = np.exp(-0.5 * ((u_grid - center_log) / sigma) ** 2)
-                        profile_area = np.trapezoid(gauss_profile, u_grid)
-                        g_weights = (peak.area / profile_area) * gauss_profile if profile_area > 0 else np.zeros_like(u_grid)
-                        denom = 1.0 + 1j * np.outer(omega_exp_s, tau_sub)
-                        Z_i = np.trapezoid(g_weights[np.newaxis, :] / denom, u_grid, axis=1)
-                    
-                    Z_total_exp += Z_i
-                    Z_indiv = cumulative_R + Z_i
-                    process_cols[f'Re_Process_{peak.id}_Ohm'] = np.real(Z_indiv)
-                    process_cols[f'NegIm_Process_{peak.id}_Ohm'] = -np.imag(Z_indiv)
-                    cumulative_R += peak.area
-                
-                rq_export_dict = {
-                    'Frequency_Hz': freq_exp_s,
-                    'Re_Exp_Ohm': re_exp_s,
-                    'NegIm_Exp_Ohm': im_exp_s,
-                    'Re_Total_Model_Ohm': np.real(Z_total_exp),
-                    'NegIm_Total_Model_Ohm': -np.imag(Z_total_exp)
-                }
-                rq_export_dict.update(process_cols)
-                
-                csv_rq_model = pd.DataFrame(rq_export_dict).to_csv(index=False)
-                st.download_button(
-                    "📥 Export 2.4 Sequential RQ Model as CSV",
-                    data=csv_rq_model,
-                    file_name=f"sequential_rq_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+        # 3. 3D Waterfall of Chemical Expansion Strain Delta_eps_chem(x/L, i)
+        plot_3d_waterfall(
+            x_wf, chem_wf,
+            r"Normalized Coordinate ($x / L$)", r"Current Density (A cm$^{-2}$)", r"$\Delta\varepsilon_{\mathrm{chem}}$ (%)",
+            f"3D Waterfall: Chemical Expansion vs. Current ({T_work} °C)", "coolwarm", "novel_chem_expansion_3d_waterfall"
+        )
+
+        # 5. Material Design Sensitivity (Tornado Chart)
+        fig, ax = plt.subplots(figsize=(6.2, 4.3))
+        y_pos = np.arange(len(df_sens))
+        h_bar = 0.28
+        ax.barh(y_pos - h_bar, df_sens["S_FE"], height=h_bar, color="tab:blue", label=r"$S_{\mathrm{FE}}$")
+        ax.barh(y_pos, df_sens["S_eff"], height=h_bar, color="tab:green", label=r"$S_{\eta,\mathrm{LHV}}$")
+        ax.barh(y_pos + h_bar, df_sens["S_ASR"], height=h_bar, color="crimson", label=r"$S_{\mathrm{ASR}}$")
+        ax.axvline(0.0, color="black", lw=1.0)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(df_sens["Parameter"])
+        style_ax(ax, r"Dimensionless Elasticity ($\partial\ln Y / \partial\ln X$)", "Material Parameter", "Material Design Sensitivity (Tornado Chart)")
+        style_legend(ax)
+        render_plot_with_download(fig, "novel_tornado_sensitivity")
+
+    with c2:
+        # 2. Thermal Instability Criterion Map h_min(T, V) = d(q_dot)/dT at const V
+        plot_2d_or_3d_map(
+            V_inst, T_inst, hmin_map * 1e3,
+            "Constant Cell Voltage (V)", "Temperature (°C)", r"$h_{\min} = (\partial\dot{q}/\partial T)_V$ (mW cm$^{-2}$ K$^{-1}$)",
+            "Thermal Runaway Criterion Map (Min Cooling Coeff.)", "RdBu_r", nov_3d,
+            "novel_thermal_instability", vcenter_zero=True, extra_zero_contour=True
+        )
+
+        # 4. Reversible Cell Round-Trip Efficiency Map eta_RT(i_EC, i_FC)
+        plot_2d_or_3d_map(
+            i_ec_rt, i_fc_rt, RT_map,
+            r"PCEC Current Density (A cm$^{-2}$)", r"PCFC Current Density (A cm$^{-2}$)", "Round-Trip Efficiency (%)",
+            f"Reversible Cell Round-Trip Efficiency ({T_work} °C)", cmap_heat, nov_3d,
+            "novel_round_trip_eff", contour_fmt="%.0f%%"
+        )
 
 # =============================================================================
 # 6. SIDEBAR BULK EXPORT (ALL FIGURES + CSV IN ONE ZIP)
